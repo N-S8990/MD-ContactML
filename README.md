@@ -1,10 +1,24 @@
-# MD-ContactML
+# 🧬 MD-ContactML
+
+![Python Version](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
+![Machine Learning](https://img.shields.io/badge/Machine%20Learning-scikit--learn-orange)
+![MDAnalysis](https://img.shields.io/badge/MDAnalysis-Trajectory%20Processing-brightgreen)
+![Status](https://img.shields.io/badge/Status-Active-success)
 
 **MD-ContactML** is a machine learning pipeline for analyzing Molecular Dynamics (MD) trajectories, extracting dynamic residue–residue contact networks at protein–protein interfaces, and performing iterative feature elimination to isolate the most critical, non-redundant biophysical interactions.
 
 ---
 
-## 🧬 Overview
+## 🛠 Tech Stack
+
+- **Data Processing & MD:** [MDAnalysis](https://www.mdanalysis.org/), [NumPy](https://numpy.org/), [Pandas](https://pandas.pydata.org/)
+- **Machine Learning:** [scikit-learn](https://scikit-learn.org/) (Random Forest, MLP Neural Networks, Logistic Regression)
+- **Visualization:** [Matplotlib](https://matplotlib.org/), [Seaborn](https://seaborn.pydata.org/)
+- **Utilities:** [tqdm](https://tqdm.github.io/) (Progress Tracking)
+
+---
+
+## 🔬 Overview
 
 In MD simulations of viral complexes (such as SARS-CoV and SARS-CoV-2 Spike RBD complexed with the human ACE2 receptor), thousands of pairwise atomic distances fluctuate over time. Many of these contact distances are highly collinear and redundant.
 
@@ -14,32 +28,25 @@ In MD simulations of viral complexes (such as SARS-CoV and SARS-CoV-2 Spike RBD 
 3. **Iterative Elimination**: 
    - Detects the most highly correlated feature pairs ($r \ge 0.90$).
    - Drops the more globally redundant feature.
-   - Evaluates machine learning classifiers (Random Forest, Multi-Layer Perceptron Neural Network, Logistic Regression) at each iteration to ensure classification accuracy is preserved.
+   - Evaluates machine learning classifiers at each iteration to ensure classification accuracy is preserved.
 4. **Visualization**: Generates accuracy decay curves, correlation heatmaps before/after pruning, and final surviving feature interaction maps.
 
 ---
 
 ## 📁 Project Structure
 
-```
+```text
 MD-ContactML/
 ├── data/
 │   └── trajectories/
-│       └── final/
-│           ├── sars-cov-2/          # Topology (.parm7) & PDB trajectories (rep1..5)
-│           ├── sars-cov-2002/       # Topology (.parm7) & PDB trajectories (rep1..5)
-│           ├── sars-cov-2-no-ace2/
-│           └── sars-cov-2002-no-ace2/
+│       └── final/           # Topology (.parm7) & PDB trajectories (rep1..5)
 ├── results/
-│   ├── figures/
-│   │   ├── accuracy_vs_features.png
-│   │   ├── final_features.png
-│   │   └── heatmap_after.png
-│   ├── elimination_log.csv
-│   └── final_features.txt
-├── ml_pipeline.py                   # Core library (feature extraction, ML models, elimination loop)
-├── run_pipeline.py                  # Main execution script
-├── requirements.txt                 # Python dependencies
+│   ├── figures/             # Visualizations (heatmaps, accuracy curves)
+│   ├── elimination_log.csv  # Step-by-step elimination tracking
+│   └── final_features.txt   # Surviving non-redundant contact pairs
+├── ml_pipeline.py           # Core library (feature extraction, ML models, logic)
+├── run_pipeline.py          # Main execution script
+├── requirements.txt         # Python dependencies
 └── README.md
 ```
 
@@ -51,6 +58,8 @@ MD-ContactML/
 Ensure you have Python 3.9+ installed. Install the required dependencies:
 
 ```bash
+git clone https://github.com/N-S8990/MD-ContactML.git
+cd MD-ContactML
 pip install -r requirements.txt
 ```
 
@@ -76,8 +85,9 @@ python run_pipeline.py \
 
 ## 🤖 Machine Learning Models
 
-* **Multi-Layer Perceptron (MLP)**: Feedforward Neural Network with 2 hidden layers (128, 64 neurons), ReLU activation, Adam optimizer.
-* **Random Forest (RF)**: 100 estimators.
+The pipeline evaluates contact networks using three models concurrently:
+* **Multi-Layer Perceptron (MLP)**: Feedforward Neural Network (128 & 64 neurons), ReLU activation, Adam optimizer.
+* **Random Forest (RF)**: 100 decision estimators for robust ensemble learning.
 * **Logistic Regression (LR)**: L-BFGS solver with standard scaling.
 
 ---
@@ -87,3 +97,6 @@ python run_pipeline.py \
 * **`results/elimination_log.csv`**: Full step-by-step log of features dropped, correlations, and classifier metrics.
 * **`results/final_features.txt`**: List of the surviving non-redundant residue contact pairs.
 * **`results/figures/`**: Visualizations including accuracy curves and correlation heatmaps.
+
+---
+*Built for computational biophysics and structural bioinformatics research.*
