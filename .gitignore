@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / testing cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment / IDE
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Output artifacts (optional to track, ignore raw big data if needed)
+# data/trajectories/*.tar.xz
+data/trajectories/
