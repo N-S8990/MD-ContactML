@@ -49,7 +49,7 @@ class MDFeatureExtractor:
         feature_names = []
         for r_atom in rbd_atoms:
             for a_atom in ace2_atoms:
-                feature_names.append(f"RBD_{r_atom.residue.resname}{r_atom.residue.resnum}_ACE2_{a_atom.residue.resname}{a_atom.residue.resnum}")
+                feature_names.append(f"RBD_{r_atom.residue.resname}{r_atom.residue.resnum}_{r_atom.index}_ACE2_{a_atom.residue.resname}{a_atom.residue.resnum}_{a_atom.index}")
                 
         # Iterate through trajectory
         n_frames = len(u.trajectory) if max_frames is None else min(len(u.trajectory), max_frames)

@@ -15,22 +15,33 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="MD-ContactML: Iterative Feature Elimination for MD Trajectories")
-    parser.add_argument("--cov_traj", type=str, default="data/trajectories/final/sars-cov-2002/strip.rep1.pdb", help="SARS-CoV trajectory file (e.g. .pdb)")
-    parser.add_argument("--cov_top", type=str, default="data/trajectories/final/sars-cov-2002/strip.parm7", help="SARS-CoV topology file (e.g. .psf or .parm7)")
-    parser.add_argument("--cov2_traj", type=str, default="data/trajectories/final/sars-cov-2/strip.rep1.pdb", help="SARS-CoV-2 trajectory file (e.g. .pdb)")
-    parser.add_argument("--cov2_top", type=str, default="data/trajectories/final/sars-cov-2/strip.parm7", help="SARS-CoV-2 topology file (e.g. .psf or .parm7)")
+    parser.add_argument("--cov_traj", type=str, default="data/current_sim/sim_traj.dcd", help="Trajectory file")
+    parser.add_argument("--cov_top", type=str, default="data/current_sim/sim_prepared.pdb", help="Topology file")
+    parser.add_argument("--cov2_traj", type=str, default="data/current_sim/sim_traj.dcd", help="Trajectory file 2")
+    parser.add_argument("--cov2_top", type=str, default="data/current_sim/sim_prepared.pdb", help="Topology file 2")
     
     parser.add_argument("--corr_threshold", type=float, default=0.90, help="Correlation threshold to drop features")
     parser.add_argument("--acc_tolerance", type=float, default=0.05, help="Max accuracy drop allowed before stopping")
     parser.add_argument("--min_features", type=int, default=10, help="Minimum number of features to keep")
     parser.add_argument("--max_frames", type=int, default=None, help="Max frames to read per trajectory (for testing)")
     
-    parser.add_argument("--out_dir", type=str, default="results", help="Output directory")
+    parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     
     args = parser.parse_args()
     
-    os.makedirs(args.out_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.out_dir, "figures"), exist_ok=True)
+    base_out = args.out_dir
+    os.makedirs(base_out, exist_ok=True)
+    
+    run_idx = 1
+    while os.path.exists(os.path.join(base_out, f"result_{run_idx}")):
+        run_idx += 1
+        
+    final_out_dir = os.path.join(base_out, f"result_{run_idx}")
+    os.makedirs(final_out_dir, exist_ok=True)
+    os.makedirs(os.path.join(final_out_dir, "figures"), exist_ok=True)
+    
+    args.out_dir = final_out_dir
+    logger.info(f"Saving results to {final_out_dir}")
     
     logger.info("=== Phase 1: Feature Extraction ===")
     # The Zenodo dataset lacks segids, so we will just compute distances between the first 200 CA atoms 
@@ -39,10 +50,8 @@ def main():
         rbd_selection="resid 1-200 and name CA",
         ace2_selection="resid 201-800 and name CA"
     )
-    # We use a wildcard *.pdb to load all 5 replicas for each virus to get enough frames for splitting
-    import glob
-    cov_traj_all = sorted(glob.glob(args.cov_traj.replace("strip.rep1.pdb", "strip.rep*.pdb")))
-    cov2_traj_all = sorted(glob.glob(args.cov2_traj.replace("strip.rep1.pdb", "strip.rep*.pdb")))
+    cov_traj_all = [args.cov_traj]
+    cov2_traj_all = [args.cov2_traj]
     
     X, y = extractor.build_dataset(args.cov_top, cov_traj_all, args.cov2_top, cov2_traj_all, max_frames=args.max_frames)
     
