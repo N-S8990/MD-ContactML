@@ -17,3 +17,10 @@ htmlcov/
 # Output artifacts (optional to track, ignore raw big data if needed)
 # data/trajectories/*.tar.xz
 data/trajectories/
+
+# Output directories
+data/current_sim/
+results/
+renders/*.png
+renders/*.pse
+

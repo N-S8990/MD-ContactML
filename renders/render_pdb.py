@@ -8,12 +8,13 @@
 import os
 import sys
 import argparse
+import glob
 
 # ========================================
 # SET YOUR PDB FILE PATH HERE
 # ========================================
 # Change this to the path of the PDB file you want to render
-DEFAULT_PDB_FILE = "/Users/nirav/Docs/MD-ContactML/6m0j.pdb" 
+DEFAULT_PDB_FILE = "/Users/nirav/Docs/MD-ContactML/1A22.pdb" 
 # ========================================
 
 def main():
@@ -33,6 +34,14 @@ def main():
 
     # Output directory is the same as the script directory (the renders folder)
     out_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    print(f"Cleaning up older renders in {out_dir}...")
+    for old_file in glob.glob(os.path.join(out_dir, "*.png")) + glob.glob(os.path.join(out_dir, "*.pse")):
+        try:
+            os.remove(old_file)
+        except OSError:
+            pass
+            
     out_png = os.path.join(out_dir, f"{base_name}.png")
     out_pse = os.path.join(out_dir, f"{base_name}.pse")
 

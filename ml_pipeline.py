@@ -24,10 +24,15 @@ logger = logging.getLogger(__name__)
 class MDFeatureExtractor:
     """Extracts pairwise C-alpha distances from MD trajectories to build ML features."""
     
-    def __init__(self, rbd_selection="protein and segid RBD and name CA", 
-                 ace2_selection="protein and segid ACE2 and name CA"):
-        self.rbd_selection = rbd_selection
-        self.ace2_selection = ace2_selection
+    def __init__(self, 
+                 target1_selection="segid A and name CA", 
+                 target2_selection="segid B and name CA",
+                 target1_name="TARGET1",
+                 target2_name="TARGET2"):
+        self.target1_selection = target1_selection
+        self.target2_selection = target2_selection
+        self.target1_name = target1_name
+        self.target2_name = target2_name
         
     def _extract_distances(self, topology, trajectory, label, max_frames=None):
         """Extracts distances for a single trajectory."""
@@ -37,29 +42,29 @@ class MDFeatureExtractor:
         u = mda.Universe(topology, trajectory)
         
         # Select atom groups
-        rbd_atoms = u.select_atoms(self.rbd_selection)
-        ace2_atoms = u.select_atoms(self.ace2_selection)
+        target1_atoms = u.select_atoms(self.target1_selection)
+        target2_atoms = u.select_atoms(self.target2_selection)
         
-        if len(rbd_atoms) == 0 or len(ace2_atoms) == 0:
-            raise ValueError(f"Selection returned 0 atoms. Check selections: {self.rbd_selection}, {self.ace2_selection}")
+        if len(target1_atoms) == 0 or len(target2_atoms) == 0:
+            raise ValueError(f"Selection returned 0 atoms. Check selections: {self.target1_selection}, {self.target2_selection}")
             
-        logger.info(f"Selected {len(rbd_atoms)} RBD atoms and {len(ace2_atoms)} ACE2 atoms.")
+        logger.info(f"Selected {len(target1_atoms)} {self.target1_name} atoms and {len(target2_atoms)} {self.target2_name} atoms.")
         
         # Prepare feature names
         feature_names = []
-        for r_atom in rbd_atoms:
-            for a_atom in ace2_atoms:
-                feature_names.append(f"RBD_{r_atom.residue.resname}{r_atom.residue.resnum}_{r_atom.index}_ACE2_{a_atom.residue.resname}{a_atom.residue.resnum}_{a_atom.index}")
+        for r_atom in target1_atoms:
+            for a_atom in target2_atoms:
+                feature_names.append(f"{self.target1_name}_{r_atom.residue.resname}{r_atom.residue.resnum}_{r_atom.index}_{self.target2_name}_{a_atom.residue.resname}{a_atom.residue.resnum}_{a_atom.index}")
                 
         # Iterate through trajectory
         n_frames = len(u.trajectory) if max_frames is None else min(len(u.trajectory), max_frames)
         logger.info(f"Extracting features across {n_frames} frames...")
         
-        features = np.zeros((n_frames, len(rbd_atoms) * len(ace2_atoms)))
+        features = np.zeros((n_frames, len(target1_atoms) * len(target2_atoms)))
         
         for i, ts in enumerate(tqdm(u.trajectory[:n_frames])):
-            # Calculate distance matrix (N_rbd, N_ace2)
-            dist_matrix = distances.distance_array(rbd_atoms.positions, ace2_atoms.positions)
+            # Calculate distance matrix (N_target1, N_target2)
+            dist_matrix = distances.distance_array(target1_atoms.positions, target2_atoms.positions)
             # Flatten to 1D array
             features[i] = dist_matrix.flatten()
             

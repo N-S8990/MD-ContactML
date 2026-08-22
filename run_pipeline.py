@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import shutil
 import pandas as pd
 
 from ml_pipeline import (
@@ -29,26 +30,23 @@ def main():
     
     args = parser.parse_args()
     
-    base_out = args.out_dir
-    os.makedirs(base_out, exist_ok=True)
-    
-    run_idx = 1
-    while os.path.exists(os.path.join(base_out, f"result_{run_idx}")):
-        run_idx += 1
+    if os.path.exists(args.out_dir):
+        logger.info(f"Removing older results in {args.out_dir}...")
+        shutil.rmtree(args.out_dir)
         
-    final_out_dir = os.path.join(base_out, f"result_{run_idx}")
-    os.makedirs(final_out_dir, exist_ok=True)
-    os.makedirs(os.path.join(final_out_dir, "figures"), exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.out_dir, "figures"), exist_ok=True)
     
-    args.out_dir = final_out_dir
-    logger.info(f"Saving results to {final_out_dir}")
+    logger.info(f"Saving results to {args.out_dir}")
     
     logger.info("=== Phase 1: Feature Extraction ===")
     # The Zenodo dataset lacks segids, so we will just compute distances between the first 200 CA atoms 
     # and the next 600 CA atoms as a proxy for RBD-ACE2 interactions to test the pipeline.
     extractor = MDFeatureExtractor(
-        rbd_selection="resid 1-200 and name CA",
-        ace2_selection="resid 201-800 and name CA"
+        target1_selection="segid A and name CA",
+        target2_selection="segid B and name CA",
+        target1_name="HGH",
+        target2_name="RECEPTOR"
     )
     cov_traj_all = [args.cov_traj]
     cov2_traj_all = [args.cov2_traj]
