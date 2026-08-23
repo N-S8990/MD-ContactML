@@ -16,7 +16,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DEFAULT_INPUT_PDB = "1A22.pdb"
+DEFAULT_INPUT_PDB = "1BRS.pdb"
 
 
 def prepare_system(input_pdb, output_pdb):
@@ -80,7 +80,7 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
         
     simulation.context.setPositions(positions)
     
-    logger.info(f"Minimizing energy (max {max_min_iters} iterations)...")
+    logger.info(f"Minimizing energy ...")
     simulation.minimizeEnergy(maxIterations=max_min_iters)
     
     # Setup reporters
@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--input_pdb", type=str, default=DEFAULT_INPUT_PDB, help="Input PDB file")
     parser.add_argument("--out_dir", type=str, default="data/current_sim", help="Output directory")
     parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files")
-    parser.add_argument("--steps", type=int, default=1000, help="Number of MD steps to run")
+    parser.add_argument("--steps", type=int, default=5000, help="Number of MD steps to run")
     parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
                         default='CPU', help="Compute platform to use")
     parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")

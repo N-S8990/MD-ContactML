@@ -25,10 +25,10 @@ class MDFeatureExtractor:
     """Extracts pairwise C-alpha distances from MD trajectories to build ML features."""
     
     def __init__(self, 
-                 target1_selection="segid A and name CA", 
-                 target2_selection="segid B and name CA",
-                 target1_name="TARGET1",
-                 target2_name="TARGET2"):
+                 target1_selection="chainID A and name CA", 
+                 target2_selection="chainID D and name CA",
+                 target1_name="BARNASE",
+                 target2_name="BARSTAR"):
         self.target1_selection = target1_selection
         self.target2_selection = target2_selection
         self.target1_name = target1_name
@@ -76,11 +76,11 @@ class MDFeatureExtractor:
         return df
         
     def build_dataset(self, cov_top, cov_traj, cov2_top, cov2_traj, max_frames=None):
-        """Build complete dataset from both CoV (label=0) and CoV2 (label=1) trajectories."""
-        logger.info("--- Processing SARS-CoV ---")
+        """Build complete dataset from both condition 1 (label=0) and condition 2 (label=1) trajectories."""
+        logger.info("--- Processing Condition 1 (e.g. Wildtype) ---")
         df_cov = self._extract_distances(cov_top, cov_traj, label=0, max_frames=max_frames)
         
-        logger.info("--- Processing SARS-CoV-2 ---")
+        logger.info("--- Processing Condition 2 (e.g. Mutant) ---")
         df_cov2 = self._extract_distances(cov2_top, cov2_traj, label=1, max_frames=max_frames)
         
         # Combine

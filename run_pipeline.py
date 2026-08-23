@@ -43,21 +43,21 @@ def main():
     # The Zenodo dataset lacks segids, so we will just compute distances between the first 200 CA atoms 
     # and the next 600 CA atoms as a proxy for RBD-ACE2 interactions to test the pipeline.
     extractor = MDFeatureExtractor(
-        target1_selection="segid A and name CA",
-        target2_selection="segid B and name CA",
-        target1_name="HGH",
-        target2_name="RECEPTOR"
+        target1_selection="chainID A and name CA",
+        target2_selection="chainID D and name CA",
+        target1_name="BARNASE",
+        target2_name="BARSTAR"
     )
     cov_traj_all = [args.cov_traj]
     cov2_traj_all = [args.cov2_traj]
     
     X, y = extractor.build_dataset(args.cov_top, cov_traj_all, args.cov2_top, cov2_traj_all, max_frames=args.max_frames)
     
-    # Keep the top 1000 features representing the closest atom pairs (the actual interface)
-    logger.info("Selecting the 1000 closest interacting atom pairs to use as features...")
+    # Keep the top 5000 features representing the closest atom pairs (the actual interface)
+    logger.info("Selecting the 5000 closest interacting atom pairs to use as features...")
     mean_distances = X.mean()
-    closest_1000_cols = mean_distances.nsmallest(1000).index
-    X = X[closest_1000_cols]
+    closest_5000_cols = mean_distances.nsmallest(5000).index
+    X = X[closest_5000_cols]
     
     # Save original features for reference
     X_orig = X.copy()
