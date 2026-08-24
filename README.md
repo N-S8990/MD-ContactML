@@ -110,7 +110,7 @@ python md_simulation.py \
 Options:
 - `--input_pdb`: Input PDB file path (default: `6m0j.pdb`).
 - `--out_dir`: Destination directory for prepared PDB and DCD trajectory (default: `data/current_sim`).
-- `--steps`: Number of MD integration steps (default: `1000`).
+- `--steps`: Number of MD integration steps (default: `5000`).
 - `--platform`: Compute platform (`CPU`, `CUDA`, `OpenCL`, `Reference`).
 
 ### 3. (Optional) Render Structure with PyMOL
