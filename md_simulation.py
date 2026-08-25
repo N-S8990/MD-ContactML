@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import shutil
+import numpy as np
 
 try:
     import openmm as mm
@@ -45,6 +46,12 @@ def prepare_system(input_pdb, output_pdb):
     
     logger.info("Solvating system...")
     fixer.addSolvent(padding=1.0 * unit.nanometers, ionicStrength=0.15 * unit.molar)
+    
+    logger.info("Centering molecule and water padding at (0,0,0)...")
+    positions = np.array(fixer.positions.value_in_unit(unit.nanometers))
+    center = np.mean(positions, axis=0)
+    positions -= center
+    fixer.positions = [mm.Vec3(*pos) for pos in positions] * unit.nanometers
     
     with open(output_pdb, 'w') as f:
         app.PDBFile.writeFile(fixer.topology, fixer.positions, f)
@@ -92,6 +99,7 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     simulation.reporters.append(app.StateDataReporter(log_path, max(1, steps // 10), step=True, 
                                                       potentialEnergy=True, temperature=True, volume=True))
                                                       
+
     logger.info(f"Running simulation for {steps} steps...")
     simulation.step(steps)
     logger.info(f"Simulation complete. Trajectory saved to {dcd_path}")

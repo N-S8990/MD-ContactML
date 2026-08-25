@@ -69,7 +69,7 @@ MD-ContactML/
 └── results/
     ├── result_1/            # Versioned run directories (auto-incremented)
     │   ├── elimination_log.csv  # Step-by-step feature removal and metric log
-    │   ├── final_features.txt   # Surviving minimal non-redundant contact pairs
+    │   ├── final_features.csv   # Surviving minimal non-redundant contact pairs
     │   └── figures/
     │       ├── accuracy_vs_features.png  # ML performance vs feature count
     │       ├── final_features.png        # Surviving feature frequency/distribution
@@ -177,7 +177,7 @@ The pipeline benchmark evaluates dynamic contact networks across multiple model 
 Each execution creates an isolated, versioned directory under `results/result_<N>/`:
 
 - **`elimination_log.csv`**: Record of each elimination step, features removed, correlation values, and model scores.
-- **`final_features.txt`**: List of surviving non-redundant residue contact pairs.
+- **`final_features.csv`**: List of surviving non-redundant residue contact pairs.
 - **`figures/accuracy_vs_features.png`**: Accuracy trajectory across feature reduction steps.
 - **`figures/final_features.png`**: Breakdown of surviving contact pairs.
 - **`figures/heatmap_after.png`**: Correlation matrix heatmap of the final feature set.

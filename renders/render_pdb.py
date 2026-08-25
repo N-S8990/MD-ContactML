@@ -8,18 +8,11 @@
 import os
 import sys
 import argparse
-import glob
 
-# ========================================
-# SET YOUR PDB FILE PATH HERE
-# ========================================
-# Change this to the path of the PDB file you want to render
-DEFAULT_PDB_FILE = "/Users/nirav/Docs/MD-ContactML/1A22.pdb" 
-# ========================================
+DEFAULT_PDB_FILE = "/Users/nirav/Docs/MD-ContactML/1AKI.pdb" 
 
 def main():
     parser = argparse.ArgumentParser(description="Render a PDB structure using PyMOL")
-    # Make the argument optional (nargs='?') and use the default value defined above
     parser.add_argument("pdb_file", nargs='?', default=DEFAULT_PDB_FILE, help="Path to the PDB file to render")
     parser.add_argument("--output_name", default=None, help="Base name for the output png and pse files. If not provided, uses the PDB filename.")
     args = parser.parse_args()
@@ -34,14 +27,6 @@ def main():
 
     # Output directory is the same as the script directory (the renders folder)
     out_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    print(f"Cleaning up older renders in {out_dir}...")
-    for old_file in glob.glob(os.path.join(out_dir, "*.png")) + glob.glob(os.path.join(out_dir, "*.pse")):
-        try:
-            os.remove(old_file)
-        except OSError:
-            pass
-            
     out_png = os.path.join(out_dir, f"{base_name}.png")
     out_pse = os.path.join(out_dir, f"{base_name}.pse")
 

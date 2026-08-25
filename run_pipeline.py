@@ -20,7 +20,6 @@ def main():
     parser.add_argument("--cov_top", type=str, default="data/current_sim/sim_prepared.pdb", help="Topology file")
     parser.add_argument("--cov2_traj", type=str, default="data/current_sim/sim_traj.dcd", help="Trajectory file 2")
     parser.add_argument("--cov2_top", type=str, default="data/current_sim/sim_prepared.pdb", help="Topology file 2")
-    
     parser.add_argument("--corr_threshold", type=float, default=0.90, help="Correlation threshold to drop features")
     parser.add_argument("--acc_tolerance", type=float, default=0.05, help="Max accuracy drop allowed before stopping")
     parser.add_argument("--min_features", type=int, default=10, help="Minimum number of features to keep")
@@ -56,7 +55,7 @@ def main():
     # Keep the top 5000 features representing the closest atom pairs (the actual interface)
     logger.info("Selecting the 5000 closest interacting atom pairs to use as features...")
     mean_distances = X.mean()
-    closest_5000_cols = mean_distances.nsmallest(5000).index
+    closest_5000_cols = mean_distances.nsmallest(1000).index
     X = X[closest_5000_cols]
     
     # Save original features for reference
@@ -80,8 +79,23 @@ def main():
     log_df.to_csv(log_path, index=False)
     logger.info(f"Saved elimination log to {log_path}")
     
-    with open(os.path.join(args.out_dir, "final_features.txt"), "w") as f:
-        f.write("\n".join(final_features))
+    # Save final features as CSV
+    final_features_df = pd.DataFrame({'feature': final_features})
+    final_features_path = os.path.join(args.out_dir, "final_features.csv")
+    final_features_df.to_csv(final_features_path, index=False)
+    logger.info(f"Saved final features to {final_features_path}")
+        
+    # Extract final accuracy and recall
+    final_acc = log_df.iloc[-1]['rf_accuracy']
+    final_recall = log_df.iloc[-1]['rf_recall']
+    
+    score_text = f"Final Model Scores (Random Forest):\nAccuracy: {final_acc:.4f}\nRecall: {final_recall:.4f}\n"
+    logger.info(f"\n{'-'*40}\n{score_text}{'-'*40}")
+    
+    final_scores_path = os.path.join(args.out_dir, "final_scores.txt")
+    with open(final_scores_path, "w") as f:
+        f.write(score_text)
+    logger.info(f"Saved final scores to {final_scores_path}")
         
     logger.info("=== Phase 5: Visualization ===")
     vis = PipelineVisualizer(output_dir=os.path.join(args.out_dir, "figures"))
@@ -89,8 +103,7 @@ def main():
     # Plot accuracy curve
     vis.plot_accuracy_vs_features(log_df)
     
-    # Plot final features
-    vis.plot_surviving_features(final_features)
+
     
     # Heatmaps (before vs after)
     vis.plot_correlation_heatmap(X_orig[final_features], "Final Feature Correlation Matrix", "heatmap_after.png")

@@ -1,7 +1,7 @@
 from MDAnalysis.analysis import distances
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, recall_score
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
@@ -15,9 +15,8 @@ import pandas as pd
 import seaborn as sns
 
 
-# ========================================
-# FEATURE_EXTRACTOR.PY
-# ========================================
+# FEATURE EXTRACTION
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -94,9 +93,8 @@ class MDFeatureExtractor:
         return X, y
 
 
-# ========================================
-# PREPROCESSOR.PY
-# ========================================
+# PREPROCESSING
+
 logger = logging.getLogger(__name__)
 
 class MDPreprocessor:
@@ -142,9 +140,8 @@ class MDPreprocessor:
         return X_train, X_test, y_train, y_test
 
 
-# ========================================
-# CORRELATION_ANALYZER.PY
-# ========================================
+# CORRELATION ANALYZING
+
 logger = logging.getLogger(__name__)
 
 class CorrelationAnalyzer:
@@ -202,9 +199,8 @@ class CorrelationAnalyzer:
             return feat_B
 
 
-# ========================================
-# MODEL_TRAINER.PY
-# ========================================
+# MODEL TRAIN
+
 logger = logging.getLogger(__name__)
 
 class ModelTrainer:
@@ -265,6 +261,7 @@ class ModelTrainer:
             # Evaluate
             acc = accuracy_score(y_test, y_pred)
             f1 = f1_score(y_test, y_pred)
+            recall = recall_score(y_test, y_pred)
             
             if y_prob is not None:
                 try:
@@ -278,17 +275,17 @@ class ModelTrainer:
             metrics[name] = {
                 'accuracy': acc,
                 'f1_score': f1,
-                'roc_auc': roc_auc
+                'roc_auc': roc_auc,
+                'recall': recall
             }
             
-            logger.debug(f"[{name.upper()}] Acc: {acc:.4f} | F1: {f1:.4f} | AUC: {roc_auc:.4f}")
+            logger.debug(f"[{name.upper()}] Acc: {acc:.4f} | F1: {f1:.4f} | AUC: {roc_auc:.4f} | Recall: {recall:.4f}")
             
         return metrics
 
 
-# ========================================
-# ELIMINATION_LOOP.PY
-# ========================================
+# ELIMINATION LOOP
+
 logger = logging.getLogger(__name__)
 
 class FeatureEliminationLoop:
@@ -395,9 +392,8 @@ class FeatureEliminationLoop:
         self.log.append(entry)
 
 
-# ========================================
-# VISUALIZER.PY
-# ========================================
+# VISUALIZER.PY 
+
 logger = logging.getLogger(__name__)
 
 class PipelineVisualizer:
