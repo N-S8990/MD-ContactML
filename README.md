@@ -54,28 +54,15 @@ In molecular dynamics simulations of viral complexes (such as the SARS-CoV-2 Spi
 
 ## 📁 Project Structure
 
-```text
-MD-ContactML/
-├── 6m0j.pdb                 # Reference SARS-CoV-2 RBD / ACE2 complex structure
-├── md_simulation.py         # OpenMM MD simulation and structure preparation script
-├── ml_pipeline.py           # Core library (feature extraction, ML models, elimination logic, plotting)
-├── run_pipeline.py          # Main execution driver for the ML contact elimination pipeline
-├── requirements.txt         # Python package dependencies
-├── renders/
-│   └── render_pdb.py        # Automated PyMOL script for high-res rendering & session generation
-├── data/
-│   ├── current_sim/         # Generated simulation outputs (trajectories .dcd, prepared .pdb, logs)
-│   └── trajectories/        # Trajectory storage
-└── results/
-    ├── result_1/            # Versioned run directories (auto-incremented)
-    │   ├── elimination_log.csv  # Step-by-step feature removal and metric log
-    │   ├── final_features.csv   # Surviving minimal non-redundant contact pairs
-    │   └── figures/
-    │       ├── accuracy_vs_features.png  # ML performance vs feature count
-    │       ├── final_features.png        # Surviving feature frequency/distribution
-    │       └── heatmap_after.png         # Correlation heatmap of final features
-    └── result_2/            # Subsequent run outputs...
-```
+| Directory / File | Description |
+| :--- | :--- |
+| **`run_pipeline.py`** | Main execution driver for the ML contact elimination pipeline. |
+| **`ml_pipeline.py`** | Core library (feature extraction, ML models, elimination logic, plotting). |
+| **`md_simulation.py`** | OpenMM MD simulation and structure preparation script. |
+| **`data/`** | Contains generated simulation outputs and trajectory storage. |
+| **`results/`** | Isolated, versioned run directories containing logs, CSVs, and plots. |
+| **`renders/`** | Automated PyMOL script for high-res rendering & session generation. |
+| **`6m0j.pdb`** | Reference SARS-CoV-2 RBD / ACE2 complex structure. |
 
 ---
 
