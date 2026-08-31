@@ -83,6 +83,8 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
             simulation = app.Simulation(topology, system, integrator)
     else:
         simulation = app.Simulation(topology, system, integrator)
+        detected_platform = simulation.context.getPlatform().getName()
+        logger.info(f"Auto-detected and using fastest platform: {detected_platform}")
         
     simulation.context.setPositions(positions)
     
@@ -109,7 +111,7 @@ def main():
     parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files")
     parser.add_argument("--steps", type=int, default=5000, help="Number of MD steps to run")
     parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
-                        default='CPU', help="Compute platform to use")
+                        default=None, help="Compute platform to use (defaults to fastest available)")
     parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")
     
     args = parser.parse_args()
