@@ -61,36 +61,37 @@ class MDFeatureExtractor:
         
         features = np.zeros((n_frames, len(target1_atoms) * len(target2_atoms)))
         
-        for i, ts in enumerate(tqdm(u.trajectory[:n_frames])):
-            # Calculate distance matrix (N_target1, N_target2)
-            dist_matrix = distances.distance_array(target1_atoms.positions, target2_atoms.positions)
-            # Flatten to 1D array
-            features[i] = dist_matrix.flatten()
-            
-        labels = np.full(n_frames, label)
-        
-        df = pd.DataFrame(features, columns=feature_names)
-        df['label'] = labels
-        
-        return df
-        
-    def build_dataset(self, cov_top, cov_traj, cov2_top, cov2_traj, max_frames=None):
-        """Build complete dataset from both condition 1 (label=0) and condition 2 (label=1) trajectories."""
-        logger.info("--- Processing Condition 1 (e.g. Wildtype) ---")
-        df_cov = self._extract_distances(cov_top, cov_traj, label=0, max_frames=max_frames)
-        
-        logger.info("--- Processing Condition 2 (e.g. Mutant) ---")
-        df_cov2 = self._extract_distances(cov2_top, cov2_traj, label=1, max_frames=max_frames)
-        
-        # Combine
-        df_full = pd.concat([df_cov, df_cov2], ignore_index=True)
-        
-        # Split back into X and y
-        y = df_full.pop('label').values
-        X = df_full
-        
-        logger.info(f"Final dataset built: {X.shape[0]} frames, {X.shape[1]} features.")
-        return X, y
+        for frame_index, _ in enumerate(u.trajectory[:n_frames]):
+            features[frame_index] = distances.distance_array(
+                target1_atoms.positions,
+                target2_atoms.positions
+            ).ravel()
+
+        return pd.DataFrame(features, columns=feature_names), np.full(n_frames, label)
+
+    def build_dataset(self, topology1, trajectories1, topology2, trajectories2, max_frames=None):
+        """Build a labeled dataset from two groups of trajectories."""
+        feature_frames = []
+        labels = []
+
+        for trajectory in trajectories1:
+            trajectory_features, trajectory_labels = self._extract_distances(
+                topology1, trajectory, label=0, max_frames=max_frames
+            )
+            feature_frames.append(trajectory_features)
+            labels.append(trajectory_labels)
+
+        for trajectory in trajectories2:
+            trajectory_features, trajectory_labels = self._extract_distances(
+                topology2, trajectory, label=1, max_frames=max_frames
+            )
+            feature_frames.append(trajectory_features)
+            labels.append(trajectory_labels)
+
+        if not feature_frames:
+            raise ValueError("At least one trajectory is required for each dataset group.")
+
+        return pd.concat(feature_frames, ignore_index=True), np.concatenate(labels)
 
 
 # PREPROCESSING
@@ -146,57 +147,8 @@ logger = logging.getLogger(__name__)
 
 class CorrelationAnalyzer:
     """Computes feature correlations and identifies redundant features for removal."""
-    
-    def __init__(self, threshold=0.90):
-        self.threshold = threshold
-        
-    def find_most_correlated_pair(self, X_train):
-        """
-        Finds the pair of features with the highest absolute Pearson correlation.
-        Returns the pair and their correlation value, or None if max corr < threshold.
-        """
-        if not isinstance(X_train, pd.DataFrame):
-            raise ValueError("X_train must be a pandas DataFrame to compute correlations with feature names.")
-            
-        logger.info(f"Computing correlation matrix for {X_train.shape[1]} features...")
-        
-        # Compute correlation matrix
-        corr_matrix = X_train.corr().abs()
-        
-        # Extract upper triangle without diagonal to find unique pairs
-        upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-        
-        # Find the max correlation value
-        max_corr = upper_tri.max().max()
-        
-        if pd.isna(max_corr) or max_corr < self.threshold:
-            logger.info(f"No feature pairs found with correlation >= {self.threshold} (max is {max_corr:.4f}).")
-            return None, None, max_corr
-            
-        # Get the feature names for the maximum correlation
-        # argmax() flattens the matrix, so we unravel it to get 2D indices
-        idx = np.unravel_index(np.nanargmax(upper_tri.values), upper_tri.shape)
-        feat_A = upper_tri.index[idx[0]]
-        feat_B = upper_tri.columns[idx[1]]
-        
-        logger.info(f"Highest correlation found: {feat_A} and {feat_B} (corr = {max_corr:.4f})")
-        return feat_A, feat_B, max_corr
-        
-    def get_feature_to_drop(self, X_train, feat_A, feat_B):
-        """
-        Given a highly correlated pair, decides which one to drop.
-        Drops the one that has a higher average absolute correlation with ALL other features.
-        """
-        # Calculate mean absolute correlation with all other features
-        corr_A = X_train.corrwith(X_train[feat_A]).abs().mean()
-        corr_B = X_train.corrwith(X_train[feat_B]).abs().mean()
-        
-        if corr_A > corr_B:
-            logger.info(f"Dropping {feat_A} (avg corr: {corr_A:.4f}) over {feat_B} (avg corr: {corr_B:.4f})")
-            return feat_A
-        else:
-            logger.info(f"Dropping {feat_B} (avg corr: {corr_B:.4f}) over {feat_A} (avg corr: {corr_A:.4f})")
-            return feat_B
+    # (Deprecated - functionality moved into FeatureEliminationLoop for batch efficiency)
+    pass
 
 
 # MODEL TRAIN
@@ -214,12 +166,14 @@ class ModelTrainer:
             'lr': LogisticRegression(
                 random_state=random_state, 
                 max_iter=1000, 
-                solver='lbfgs'
+                solver='lbfgs',
+                n_jobs=-1
             ),
             'rf': RandomForestClassifier(
                 random_state=random_state, 
                 n_estimators=100, 
-                max_depth=None
+                max_depth=None,
+                n_jobs=-1
             ),
             'mlp': MLPClassifier(
                 random_state=random_state,
@@ -292,74 +246,95 @@ class FeatureEliminationLoop:
     """Orchestrates the iterative removal of highly correlated features."""
     
     def __init__(self, corr_threshold=0.90, accuracy_tolerance=0.05, min_features=10):
-        self.analyzer = CorrelationAnalyzer(threshold=corr_threshold)
+        self.corr_threshold = corr_threshold
         self.trainer = ModelTrainer()
         self.accuracy_tolerance = accuracy_tolerance
         self.min_features = min_features
         self.log = []
         
     def run(self, X_train, X_test, y_train, y_test, model_to_track='rf'):
-        """
-        Runs the iterative elimination loop.
-        Returns the final feature subset and the elimination log.
-        """
-        logger.info("Starting Iterative Feature Elimination Loop")
+        logger.info("Starting Iterative Feature Elimination Loop (Optimized Batch Mode)")
         
         current_X_train = X_train.copy()
         current_X_test = X_test.copy()
         
-        # Iteration 0: Baseline
         logger.info(f"--- ITERATION 0 (Baseline) | {current_X_train.shape[1]} features ---")
         metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
-        
         baseline_acc = metrics[model_to_track]['accuracy']
-        
         self._record_log(0, "None (Baseline)", current_X_train.shape[1], float('nan'), metrics)
         
         iteration = 1
         
-        # Initialize progress bar for the elimination loop
+        logger.info("Computing initial correlation matrix (this might take a moment)...")
+        # Cache the correlation matrix
+        corr_matrix = current_X_train.corr().abs()
+        mean_corrs = corr_matrix.mean()
+        
         total_to_drop = current_X_train.shape[1] - self.min_features
         pbar = tqdm(total=total_to_drop, desc="Eliminating Features", unit="feat")
         
         while current_X_train.shape[1] > self.min_features:
             logger.debug(f"--- ITERATION {iteration} | {current_X_train.shape[1]} features ---")
             
-            # 1. Find most correlated pair
-            feat_A, feat_B, max_corr = self.analyzer.find_most_correlated_pair(current_X_train)
+            # Extract upper triangle to find unique pairs
+            upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
             
-            # Check stopping condition 1: No high correlations left
-            if feat_A is None:
+            # Find all pairs with correlation > threshold
+            high_corr_pairs = upper_tri.stack()
+            high_corr_pairs = high_corr_pairs[high_corr_pairs > self.corr_threshold]
+            
+            if len(high_corr_pairs) == 0:
                 logger.info("STOPPING: No highly correlated features remain.")
                 break
                 
-            # 2. Decide which to drop
-            feat_to_drop = self.analyzer.get_feature_to_drop(current_X_train, feat_A, feat_B)
+            # Sort by highest correlation
+            high_corr_pairs = high_corr_pairs.sort_values(ascending=False)
             
-            # 3. Drop it
-            current_X_train = current_X_train.drop(columns=[feat_to_drop])
-            current_X_test = current_X_test.drop(columns=[feat_to_drop])
+            # Drop up to 100 features in a single batch
+            features_to_drop = set()
+            dropped_info = []
             
-            # 4. Retrain and evaluate
+            for (feat_A, feat_B), corr_val in high_corr_pairs.items():
+                if len(features_to_drop) >= 100:
+                    break
+                    
+                if feat_A not in features_to_drop and feat_B not in features_to_drop:
+                    if mean_corrs[feat_A] > mean_corrs[feat_B]:
+                        features_to_drop.add(feat_A)
+                        dropped_info.append((feat_A, corr_val))
+                    else:
+                        features_to_drop.add(feat_B)
+                        dropped_info.append((feat_B, corr_val))
+                        
+            if not features_to_drop:
+                break
+                
+            features_to_drop = list(features_to_drop)
+            max_corr_in_batch = dropped_info[0][1]
+            
+            logger.info(f"Dropping {len(features_to_drop)} features in this batch (Max corr: {max_corr_in_batch:.4f})")
+            
+            current_X_train = current_X_train.drop(columns=features_to_drop)
+            current_X_test = current_X_test.drop(columns=features_to_drop)
+            
+            # Drop from cached matrix instead of recalculating
+            corr_matrix = corr_matrix.drop(index=features_to_drop, columns=features_to_drop)
+            mean_corrs = mean_corrs.drop(index=features_to_drop)
+            
             metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
             current_acc = metrics[model_to_track]['accuracy']
             
-            # 5. Log
-            self._record_log(iteration, feat_to_drop, current_X_train.shape[1], max_corr, metrics)
+            self._record_log(iteration, f"Batch of {len(features_to_drop)}", current_X_train.shape[1], max_corr_in_batch, metrics)
             
-            # Update progress bar
-            pbar.set_postfix({'acc': f"{current_acc:.2f}", 'corr': f"{max_corr:.2f}"})
-            pbar.update(1)
+            pbar.set_postfix({'acc': f"{current_acc:.2f}", 'corr': f"{max_corr_in_batch:.2f}"})
+            pbar.update(len(features_to_drop))
             
-            # Check stopping condition 2: Accuracy drop too large
             if (baseline_acc - current_acc) > self.accuracy_tolerance:
                 logger.warning(f"STOPPING: Accuracy dropped by more than tolerance " 
                                f"({baseline_acc:.4f} -> {current_acc:.4f}). "
                                f"Reverting last drop.")
-                # Revert the drop
-                current_X_train[feat_to_drop] = X_train[feat_to_drop]
-                current_X_test[feat_to_drop] = X_test[feat_to_drop]
-                # Remove the last log entry as it was reverted
+                current_X_train[features_to_drop] = X_train[features_to_drop]
+                current_X_test[features_to_drop] = X_test[features_to_drop]
                 self.log.pop()
                 break
                 
@@ -371,7 +346,6 @@ class FeatureEliminationLoop:
             logger.info(f"STOPPING: Reached minimum feature count ({self.min_features}).")
             
         logger.info(f"Elimination complete. Final feature count: {current_X_train.shape[1]}")
-        
         log_df = pd.DataFrame(self.log)
         return current_X_train.columns.tolist(), log_df
         
@@ -384,7 +358,6 @@ class FeatureEliminationLoop:
             'dropped_corr': corr_val
         }
         
-        # Flatten metrics into the log row
         for model_name, model_metrics in metrics.items():
             for metric_name, val in model_metrics.items():
                 entry[f"{model_name}_{metric_name}"] = val
@@ -456,25 +429,3 @@ class PipelineVisualizer:
         logger.info(f"Saved heatmap to {out_path}")
         plt.close()
         
-    def plot_surviving_features(self, final_features, importances=None):
-        """Plots a bar chart of the final surviving features."""
-        plt.figure(figsize=(10, max(6, len(final_features) * 0.3)))
-        
-        if importances is not None:
-            # Sort by importance
-            df = pd.DataFrame({'Feature': final_features, 'Importance': importances})
-            df = df.sort_values('Importance', ascending=True)
-            plt.barh(df['Feature'], df['Importance'], color='skyblue')
-            plt.xlabel('Model Importance')
-        else:
-            # Just list them
-            plt.barh(final_features, [1]*len(final_features), color='lightgreen')
-            plt.xlabel('Surviving Feature (Equal Weight)')
-            
-        plt.title(f'Final Minimal Feature Set ({len(final_features)} residue pairs)')
-        plt.tight_layout()
-        
-        out_path = os.path.join(self.output_dir, 'final_features.png')
-        plt.savefig(out_path, dpi=300)
-        logger.info(f"Saved plot to {out_path}")
-        plt.close()

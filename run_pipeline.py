@@ -53,10 +53,10 @@ def main():
     X, y = extractor.build_dataset(args.cov_top, cov_traj_all, args.cov2_top, cov2_traj_all, max_frames=args.max_frames)
     
     # Keep the top 5000 features representing the closest atom pairs (the actual interface)
-    logger.info("Selecting the 5000 closest interacting atom pairs to use as features...")
-    mean_distances = X.mean()
-    closest_5000_cols = mean_distances.nsmallest(1000).index
-    X = X[closest_5000_cols]
+    # logger.info("Selecting the 5000 closest interacting atom pairs to use as features...")
+    # mean_distances = X.mean()
+    # closest_5000_cols = mean_distances.nsmallest(1000).index
+    # X = X[closest_5000_cols]
     
     # Save original features for reference
     X_orig = X.copy()

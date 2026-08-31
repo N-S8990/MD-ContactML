@@ -14,11 +14,11 @@
 ## 🛠 Tech Stack
 
 - **Molecular Dynamics & Structure Prep:** [OpenMM](https://openmm.org/), [PDBFixer](https://github.com/openmm/pdbfixer) (Amber14 forcefield, PME, Langevin dynamics, explicit solvation)
-- **Data Processing & MD Trajectories:** [MDAnalysis](https://www.mdanalysis.org/), [NumPy](https://numpy.org/), [Pandas](https://pandas.pydata.org/), [SciPy](https://scipy.org/)
+- **Data Processing & MD Trajectories:** [MDAnalysis](https://www.mdanalysis.org/), [NumPy](https://numpy.org/), [Pandas](https://pandas.pydata.org/)
 - **Machine Learning:** [scikit-learn](https://scikit-learn.org/) (Random Forest, Multi-Layer Perceptron Neural Networks, Logistic Regression)
 - **3D Structure Visualization:** [PyMOL](https://pymol.org/) (Headless automated cartoon rendering and session export)
 - **Data Visualization:** [Matplotlib](https://matplotlib.org/), [Seaborn](https://seaborn.pydata.org/)
-- **Utilities:** [tqdm](https://tqdm.github.io/) (Progress Tracking), [PyYAML](https://pyyaml.org/)
+- **Utilities:** [tqdm](https://tqdm.github.io/) (Progress Tracking)
 
 ---
 

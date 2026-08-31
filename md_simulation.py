@@ -21,7 +21,7 @@ DEFAULT_INPUT_PDB = "1BRS.pdb"
 
 
 def prepare_system(input_pdb, output_pdb):
-    """Uses PDBFixer to clean the structure and add missing atoms/water."""
+
     logger.info(f"Preparing system from {input_pdb}...")
     fixer = PDBFixer(filename=input_pdb)
     
@@ -60,7 +60,6 @@ def prepare_system(input_pdb, output_pdb):
     return fixer.topology, fixer.positions
 
 def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_name=None, max_min_iters=0):
-    """Sets up and runs the MD simulation."""
     logger.info("Setting up simulation parameters...")
     
     # Use amber14 forcefield
@@ -99,7 +98,6 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     simulation.reporters.append(app.StateDataReporter(log_path, max(1, steps // 10), step=True, 
                                                       potentialEnergy=True, temperature=True, volume=True))
                                                       
-
     logger.info(f"Running simulation for {steps} steps...")
     simulation.step(steps)
     logger.info(f"Simulation complete. Trajectory saved to {dcd_path}")
