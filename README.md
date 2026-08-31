@@ -70,16 +70,17 @@ In molecular dynamics simulations of viral complexes (such as the SARS-CoV-2 Spi
 
 ### 1. Installation
 
-Clone the repository and install the dependencies:
+The easiest and most reliable way to install all dependencies (including OpenMM and PDBFixer, which require C++ compilers) is using Conda:
 
 ```bash
 git clone https://github.com/N-S8990/MD-ContactML.git
 cd MD-ContactML
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate md-contactml
 ```
 
 > [!TIP]
-> For OpenMM with GPU acceleration (CUDA/OpenCL) or PyMOL rendering, ensure appropriate drivers and Conda/pip wheels are configured.
+> If you cannot use Conda, you can still install the python dependencies using `pip install -r requirements.txt`, but you will need to install OpenMM and PDBFixer manually.
 
 ### 2. (Optional) Run Molecular Dynamics Simulation
 
