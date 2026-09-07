@@ -17,7 +17,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DEFAULT_INPUT_PDB = "1BRS.pdb"
+DEFAULT_INPUT_PDB = "1A22.pdb"
 
 
 def prepare_system(input_pdb, output_pdb):
@@ -59,7 +59,8 @@ def prepare_system(input_pdb, output_pdb):
     logger.info(f"Prepared system saved to {output_pdb}")
     return fixer.topology, fixer.positions
 
-def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_name=None, max_min_iters=0):
+def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_name=None,
+                   max_min_iters=0, seed=None, report_interval=50000):
     logger.info("Setting up simulation parameters...")
     
     # Use amber14 forcefield
@@ -71,6 +72,8 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
                                      
     # Langevin integrator
     integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
+    if seed is not None:
+        integrator.setRandomNumberSeed(seed)
     
     # Try to use hardware acceleration if specified or available
     if platform_name:
@@ -83,10 +86,12 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
             simulation = app.Simulation(topology, system, integrator)
     else:
         simulation = app.Simulation(topology, system, integrator)
-        detected_platform = simulation.context.getPlatform().getName()
-        logger.info(f"Auto-detected and using fastest platform: {detected_platform}")
         
     simulation.context.setPositions(positions)
+    if seed is None:
+        simulation.context.setVelocitiesToTemperature(300 * unit.kelvin)
+    else:
+        simulation.context.setVelocitiesToTemperature(300 * unit.kelvin, seed)
     
     logger.info(f"Minimizing energy ...")
     simulation.minimizeEnergy(maxIterations=max_min_iters)
@@ -96,7 +101,7 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     dcd_path = os.path.join(out_dir, f"{prefix}_traj.dcd")
     log_path = os.path.join(out_dir, f"{prefix}_sim.log")
     
-    simulation.reporters.append(app.DCDReporter(dcd_path, max(1, steps // 100)))
+    simulation.reporters.append(app.DCDReporter(dcd_path, max(1, report_interval)))
     simulation.reporters.append(app.StateDataReporter(log_path, max(1, steps // 10), step=True, 
                                                       potentialEnergy=True, temperature=True, volume=True))
                                                       
@@ -109,10 +114,14 @@ def main():
     parser.add_argument("--input_pdb", type=str, default=DEFAULT_INPUT_PDB, help="Input PDB file")
     parser.add_argument("--out_dir", type=str, default="data/current_sim", help="Output directory")
     parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files")
-    parser.add_argument("--steps", type=int, default=5000, help="Number of MD steps to run")
+    parser.add_argument("--steps", type=int, default=50000, help="Number of MD steps to run")
     parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
-                        default=None, help="Compute platform to use (defaults to fastest available)")
+                        default='CPU', help="Compute platform to use")
     parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed; use a different seed for every independent replica.")
+    parser.add_argument("--report_interval", type=int, default=50000,
+                        help="Save one DCD frame every N steps (50,000 = 100 ps at 2 fs timestep).")
     
     args = parser.parse_args()
     
@@ -123,7 +132,8 @@ def main():
     prep_pdb = os.path.join(args.out_dir, f"{args.prefix}_prepared.pdb")
     
     topology, positions = prepare_system(args.input_pdb, prep_pdb)
-    run_simulation(topology, positions, args.out_dir, args.prefix, args.steps, args.platform, args.max_min_iters)
+    run_simulation(topology, positions, args.out_dir, args.prefix, args.steps, args.platform,
+                   args.max_min_iters, args.seed, args.report_interval)
 
 if __name__ == "__main__":
     main()

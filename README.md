@@ -115,10 +115,18 @@ Outputs will be saved in `renders/`:
 
 ### 4. Run the Feature Elimination & ML Pipeline
 
-Run the contact extraction and iterative elimination loop:
+Run the contact extraction and iterative elimination loop. This is a supervised
+comparison: provide at least three *independent* replicas for each biological
+condition. Do not use the same trajectory in both classes.
 
 ```bash
-python run_pipeline.py
+python run_pipeline.py \
+  --class0_top data/wt_rep1/sim_prepared.pdb \
+  --class0_traj data/wt_rep1/sim_traj.dcd data/wt_rep2/sim_traj.dcd data/wt_rep3/sim_traj.dcd \
+  --class1_top data/mut_rep1/sim_prepared.pdb \
+  --class1_traj data/mut_rep1/sim_traj.dcd data/mut_rep2/sim_traj.dcd data/mut_rep3/sim_traj.dcd \
+  --target1_selection "chainID A and name CA" \
+  --target2_selection "chainID B and name CA"
 ```
 
 ### 5. Custom Pipeline Parameters
@@ -127,26 +135,32 @@ Configure trajectory inputs, thresholds, and convergence criteria:
 
 ```bash
 python run_pipeline.py \
-  --cov_traj data/current_sim/sim_traj.dcd \
-  --cov_top data/current_sim/sim_prepared.pdb \
-  --cov2_traj data/current_sim/sim_traj.dcd \
-  --cov2_top data/current_sim/sim_prepared.pdb \
+  --class0_top data/wt_rep1/sim_prepared.pdb \
+  --class0_traj data/wt_rep1/sim_traj.dcd data/wt_rep2/sim_traj.dcd data/wt_rep3/sim_traj.dcd \
+  --class1_top data/mut_rep1/sim_prepared.pdb \
+  --class1_traj data/mut_rep1/sim_traj.dcd data/mut_rep2/sim_traj.dcd data/mut_rep3/sim_traj.dcd \
   --corr_threshold 0.85 \
   --acc_tolerance 0.05 \
   --min_features 10 \
+  --frame_stride 10 \
   --out_dir results
 ```
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `--cov_traj` | `data/current_sim/sim_traj.dcd` | Primary trajectory file (`.dcd` / `.pdb` / `.xtc`) |
-| `--cov_top` | `data/current_sim/sim_prepared.pdb` | Primary topology file (`.pdb` / `.parm7`) |
-| `--cov2_traj` | `data/current_sim/sim_traj.dcd` | Comparison / condition 2 trajectory file |
-| `--cov2_top` | `data/current_sim/sim_prepared.pdb` | Comparison / condition 2 topology file |
+| `--class0_traj` | required | Independent condition-0 replica trajectories (minimum 3) |
+| `--class0_top` | required | Condition-0 topology (`.pdb` / `.parm7`) |
+| `--class1_traj` | required | Independent condition-1 replica trajectories (minimum 3) |
+| `--class1_top` | required | Condition-1 topology (`.pdb` / `.parm7`) |
+| `--target1_selection` | `chainID A and name CA` | MDAnalysis selection for complex partner 1 |
+| `--target2_selection` | `chainID B and name CA` | MDAnalysis selection for complex partner 2 |
 | `--corr_threshold` | `0.90` | Pearson correlation coefficient threshold for redundancy |
 | `--acc_tolerance` | `0.05` | Maximum allowable accuracy drop from baseline |
 | `--min_features` | `10` | Minimum number of features to retain |
 | `--max_frames` | `None` | Max frames to read per trajectory (useful for quick testing) |
+| `--frame_stride` | `1` | Keep every Nth frame; use this to reduce autocorrelation and runtime |
+| `--cv_folds` | `3` | Replica-aware folds; requires at least this many replicas in each class |
+| `--test_fold` | `0` | Which replica-aware fold is held out for the reported score |
 | `--out_dir` | `results` | Base directory for auto-incrementing result folders (`result_1`, `result_2`, ...) |
 
 ---

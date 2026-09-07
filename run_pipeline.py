@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import pandas as pd
+from pathlib import Path
 
 from ml_pipeline import (
     MDFeatureExtractor,
@@ -16,18 +17,40 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="MD-ContactML: Iterative Feature Elimination for MD Trajectories")
-    parser.add_argument("--cov_traj", type=str, default="data/current_sim/sim_traj.dcd", help="Trajectory file")
-    parser.add_argument("--cov_top", type=str, default="data/current_sim/sim_prepared.pdb", help="Topology file")
-    parser.add_argument("--cov2_traj", type=str, default="data/current_sim/sim_traj.dcd", help="Trajectory file 2")
-    parser.add_argument("--cov2_top", type=str, default="data/current_sim/sim_prepared.pdb", help="Topology file 2")
+    parser.add_argument("--class0_traj", nargs="+", required=True,
+                        help="Independent condition-0 replica trajectories (minimum three).")
+    parser.add_argument("--class0_top", required=True, help="Topology for condition 0.")
+    parser.add_argument("--class1_traj", nargs="+", required=True,
+                        help="Independent condition-1 replica trajectories (minimum three).")
+    parser.add_argument("--class1_top", required=True, help="Topology for condition 1.")
+    parser.add_argument("--target1_selection", default="chainID A and name CA",
+                        help="MDAnalysis selection for complex partner 1.")
+    parser.add_argument("--target2_selection", default="chainID B and name CA",
+                        help="MDAnalysis selection for complex partner 2.")
+    parser.add_argument("--target1_name", default="PARTNER1", help="Label used in contact feature names.")
+    parser.add_argument("--target2_name", default="PARTNER2", help="Label used in contact feature names.")
     parser.add_argument("--corr_threshold", type=float, default=0.90, help="Correlation threshold to drop features")
     parser.add_argument("--acc_tolerance", type=float, default=0.05, help="Max accuracy drop allowed before stopping")
     parser.add_argument("--min_features", type=int, default=10, help="Minimum number of features to keep")
     parser.add_argument("--max_frames", type=int, default=None, help="Max frames to read per trajectory (for testing)")
+    parser.add_argument("--frame_stride", type=int, default=1,
+                        help="Keep every Nth trajectory frame (default: 1).")
+    parser.add_argument("--cv_folds", type=int, default=3,
+                        help="Number of replica-aware folds; requires this many replicas per class.")
+    parser.add_argument("--test_fold", type=int, default=0,
+                        help="Which replica-aware fold to reserve for testing (0-based).")
     
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     
     args = parser.parse_args()
+
+    class0_paths = {Path(path).resolve() for path in args.class0_traj}
+    class1_paths = {Path(path).resolve() for path in args.class1_traj}
+    shared_paths = class0_paths & class1_paths
+    if shared_paths:
+        parser.error("A trajectory cannot appear in both classes: " + ", ".join(map(str, shared_paths)))
+    if len(args.class0_traj) < args.cv_folds or len(args.class1_traj) < args.cv_folds:
+        parser.error(f"Provide at least {args.cv_folds} independent trajectories for each class.")
     
     if os.path.exists(args.out_dir):
         logger.info(f"Removing older results in {args.out_dir}...")
@@ -39,18 +62,16 @@ def main():
     logger.info(f"Saving results to {args.out_dir}")
     
     logger.info("=== Phase 1: Feature Extraction ===")
-    # The Zenodo dataset lacks segids, so we will just compute distances between the first 200 CA atoms 
-    # and the next 600 CA atoms as a proxy for RBD-ACE2 interactions to test the pipeline.
     extractor = MDFeatureExtractor(
-        target1_selection="chainID A and name CA",
-        target2_selection="chainID D and name CA",
-        target1_name="BARNASE",
-        target2_name="BARSTAR"
+        target1_selection=args.target1_selection,
+        target2_selection=args.target2_selection,
+        target1_name=args.target1_name,
+        target2_name=args.target2_name
     )
-    cov_traj_all = [args.cov_traj]
-    cov2_traj_all = [args.cov2_traj]
-    
-    X, y = extractor.build_dataset(args.cov_top, cov_traj_all, args.cov2_top, cov2_traj_all, max_frames=args.max_frames)
+    X, y, groups = extractor.build_dataset(
+        args.class0_top, args.class0_traj, args.class1_top, args.class1_traj,
+        max_frames=args.max_frames, frame_stride=args.frame_stride
+    )
     
     # Keep the top 5000 features representing the closest atom pairs (the actual interface)
     # logger.info("Selecting the 5000 closest interacting atom pairs to use as features...")
@@ -62,8 +83,8 @@ def main():
     X_orig = X.copy()
     
     logger.info("=== Phase 2: Preprocessing ===")
-    preprocessor = MDPreprocessor()
-    X_train, X_test, y_train, y_test = preprocessor.preprocess(X, y)
+    preprocessor = MDPreprocessor(n_splits=args.cv_folds, test_fold=args.test_fold)
+    X_train, X_test, y_train, y_test = preprocessor.preprocess(X, y, groups)
     
     logger.info("=== Phase 3 & 4: Iterative Elimination Loop ===")
     loop = FeatureEliminationLoop(

@@ -2,7 +2,7 @@ from MDAnalysis.analysis import distances
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
@@ -24,16 +24,16 @@ class MDFeatureExtractor:
     """Extracts pairwise C-alpha distances from MD trajectories to build ML features."""
     
     def __init__(self, 
-                 target1_selection="chainID A and name CA", 
-                 target2_selection="chainID D and name CA",
-                 target1_name="BARNASE",
-                 target2_name="BARSTAR"):
+                 target1_selection="chainID A ", 
+                 target2_selection="chainID B ",
+                 target1_name="GH",
+                 target2_name="GHR"):
         self.target1_selection = target1_selection
         self.target2_selection = target2_selection
         self.target1_name = target1_name
         self.target2_name = target2_name
         
-    def _extract_distances(self, topology, trajectory, label, max_frames=None):
+    def _extract_distances(self, topology, trajectory, label, max_frames=None, frame_stride=1):
         """Extracts distances for a single trajectory."""
         logger.info(f"Loading trajectory: {trajectory}")
         
@@ -53,15 +53,28 @@ class MDFeatureExtractor:
         feature_names = []
         for r_atom in target1_atoms:
             for a_atom in target2_atoms:
-                feature_names.append(f"{self.target1_name}_{r_atom.residue.resname}{r_atom.residue.resnum}_{r_atom.index}_{self.target2_name}_{a_atom.residue.resname}{a_atom.residue.resnum}_{a_atom.index}")
+                # Chain and residue identifiers are stable across independently
+                # simulated replicas, unlike atom indices after a mutation.
+                feature_names.append(
+                    f"{self.target1_name}_{r_atom.chainID}:{r_atom.residue.resid}_"
+                    f"{self.target2_name}_{a_atom.chainID}:{a_atom.residue.resid}"
+                )
                 
         # Iterate through trajectory
-        n_frames = len(u.trajectory) if max_frames is None else min(len(u.trajectory), max_frames)
+        if frame_stride < 1:
+            raise ValueError("frame_stride must be at least 1.")
+        frame_indices = list(range(0, len(u.trajectory), frame_stride))
+        if max_frames is not None:
+            frame_indices = frame_indices[:max_frames]
+        n_frames = len(frame_indices)
+        if n_frames == 0:
+            raise ValueError(f"Trajectory {trajectory} contains no frames to extract.")
         logger.info(f"Extracting features across {n_frames} frames...")
         
         features = np.zeros((n_frames, len(target1_atoms) * len(target2_atoms)))
         
-        for frame_index, _ in enumerate(u.trajectory[:n_frames]):
+        for frame_index, trajectory_index in enumerate(frame_indices):
+            u.trajectory[trajectory_index]
             features[frame_index] = distances.distance_array(
                 target1_atoms.positions,
                 target2_atoms.positions
@@ -69,29 +82,46 @@ class MDFeatureExtractor:
 
         return pd.DataFrame(features, columns=feature_names), np.full(n_frames, label)
 
-    def build_dataset(self, topology1, trajectories1, topology2, trajectories2, max_frames=None):
+    def build_dataset(self, topology1, trajectories1, topology2, trajectories2,
+                      max_frames=None, frame_stride=1):
         """Build a labeled dataset from two groups of trajectories."""
         feature_frames = []
         labels = []
+        groups = []
 
-        for trajectory in trajectories1:
+        for trajectory_index, trajectory in enumerate(trajectories1):
             trajectory_features, trajectory_labels = self._extract_distances(
-                topology1, trajectory, label=0, max_frames=max_frames
+                topology1, trajectory, label=0, max_frames=max_frames, frame_stride=frame_stride
             )
             feature_frames.append(trajectory_features)
             labels.append(trajectory_labels)
+            groups.append(np.full(len(trajectory_labels), f"class0_replica_{trajectory_index}"))
 
-        for trajectory in trajectories2:
+        for trajectory_index, trajectory in enumerate(trajectories2):
             trajectory_features, trajectory_labels = self._extract_distances(
-                topology2, trajectory, label=1, max_frames=max_frames
+                topology2, trajectory, label=1, max_frames=max_frames, frame_stride=frame_stride
             )
             feature_frames.append(trajectory_features)
             labels.append(trajectory_labels)
+            groups.append(np.full(len(trajectory_labels), f"class1_replica_{trajectory_index}"))
 
         if not feature_frames:
             raise ValueError("At least one trajectory is required for each dataset group.")
 
-        return pd.concat(feature_frames, ignore_index=True), np.concatenate(labels)
+        reference_columns = feature_frames[0].columns
+        mismatched = [
+            index for index, frame in enumerate(feature_frames[1:], start=1)
+            if not frame.columns.equals(reference_columns)
+        ]
+        if mismatched:
+            raise ValueError(
+                "Replica topologies do not produce the same contact-feature schema. "
+                "Use equivalent chain/residue numbering and selections for every replica; "
+                f"mismatched datasets: {mismatched}."
+            )
+
+        return (pd.concat(feature_frames, ignore_index=True), np.concatenate(labels),
+                np.concatenate(groups))
 
 
 # PREPROCESSING
@@ -101,13 +131,14 @@ logger = logging.getLogger(__name__)
 class MDPreprocessor:
     """Preprocesses MD feature data for ML models."""
     
-    def __init__(self, test_size=0.2, random_state=42):
-        self.test_size = test_size
+    def __init__(self, n_splits=3, test_fold=0, random_state=42):
+        self.n_splits = n_splits
+        self.test_fold = test_fold
         self.random_state = random_state
         self.scaler = StandardScaler()
         
-    def preprocess(self, X, y):
-        """Cleans, splits, and scales the dataset."""
+    def preprocess(self, X, y, groups):
+        """Cleans, splits by replica, and scales the dataset without leakage."""
         logger.info("Preprocessing data...")
         
         # 1. Clean data (handle NaN/Inf)
@@ -117,10 +148,31 @@ class MDPreprocessor:
                 logger.warning(f"Found {X.isna().sum().sum()} missing values. Filling with column means.")
                 X = X.fillna(X.mean())
         
-        # 2. Train/Test split (stratified)
-        logger.info(f"Splitting data ({1-self.test_size:.2f} train / {self.test_size:.2f} test)...")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=self.test_size, random_state=self.random_state, stratify=y
+        # 2. Hold out entire trajectories. Random frame-level splits would put highly
+        # correlated snapshots from one replica in both train and test sets.
+        groups = np.asarray(groups)
+        y = np.asarray(y)
+        class_group_counts = [len(np.unique(groups[y == label])) for label in np.unique(y)]
+        if len(class_group_counts) != 2 or min(class_group_counts) < self.n_splits:
+            raise ValueError(
+                f"Replica-aware evaluation needs at least {self.n_splits} independent "
+                f"trajectories per class; found {class_group_counts}."
+            )
+        if not 0 <= self.test_fold < self.n_splits:
+            raise ValueError(f"test_fold must be between 0 and {self.n_splits - 1}.")
+        splitter = StratifiedGroupKFold(
+            n_splits=self.n_splits, shuffle=True, random_state=self.random_state
+        )
+        splits = splitter.split(X, y, groups)
+        for fold_index, (train_idx, test_idx) in enumerate(splits):
+            if fold_index == self.test_fold:
+                break
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        logger.info(
+            "Replica-aware split %s: %s train replicas, %s held-out replicas.",
+            self.test_fold,
+            len(np.unique(groups[train_idx])), len(np.unique(groups[test_idx]))
         )
         
         # 3. Standardization (fit ONLY on train to avoid data leakage)
@@ -147,8 +199,57 @@ logger = logging.getLogger(__name__)
 
 class CorrelationAnalyzer:
     """Computes feature correlations and identifies redundant features for removal."""
-    # (Deprecated - functionality moved into FeatureEliminationLoop for batch efficiency)
-    pass
+    
+    def __init__(self, threshold=0.90):
+        self.threshold = threshold
+        
+    def find_most_correlated_pair(self, X_train):
+        """
+        Finds the pair of features with the highest absolute Pearson correlation.
+        Returns the pair and their correlation value, or None if max corr < threshold.
+        """
+        if not isinstance(X_train, pd.DataFrame):
+            raise ValueError("X_train must be a pandas DataFrame to compute correlations with feature names.")
+            
+        logger.info(f"Computing correlation matrix for {X_train.shape[1]} features...")
+        
+        # Compute correlation matrix
+        corr_matrix = X_train.corr().abs()
+        
+        # Extract upper triangle without diagonal to find unique pairs
+        upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        
+        # Find the max correlation value
+        max_corr = upper_tri.max().max()
+        
+        if pd.isna(max_corr) or max_corr < self.threshold:
+            logger.info(f"No feature pairs found with correlation >= {self.threshold} (max is {max_corr:.4f}).")
+            return None, None, max_corr
+            
+        # Get the feature names for the maximum correlation
+        # argmax() flattens the matrix, so we unravel it to get 2D indices
+        idx = np.unravel_index(np.nanargmax(upper_tri.values), upper_tri.shape)
+        feat_A = upper_tri.index[idx[0]]
+        feat_B = upper_tri.columns[idx[1]]
+        
+        logger.info(f"Highest correlation found: {feat_A} and {feat_B} (corr = {max_corr:.4f})")
+        return feat_A, feat_B, max_corr
+        
+    def get_feature_to_drop(self, X_train, feat_A, feat_B):
+        """
+        Given a highly correlated pair, decides which one to drop.
+        Drops the one that has a higher average absolute correlation with ALL other features.
+        """
+        # Calculate mean absolute correlation with all other features
+        corr_A = X_train.corrwith(X_train[feat_A]).abs().mean()
+        corr_B = X_train.corrwith(X_train[feat_B]).abs().mean()
+        
+        if corr_A > corr_B:
+            logger.info(f"Dropping {feat_A} (avg corr: {corr_A:.4f}) over {feat_B} (avg corr: {corr_B:.4f})")
+            return feat_A
+        else:
+            logger.info(f"Dropping {feat_B} (avg corr: {corr_B:.4f}) over {feat_A} (avg corr: {corr_A:.4f})")
+            return feat_B
 
 
 # MODEL TRAIN
@@ -166,24 +267,17 @@ class ModelTrainer:
             'lr': LogisticRegression(
                 random_state=random_state, 
                 max_iter=1000, 
-                solver='lbfgs',
-                n_jobs=-1
+                solver='lbfgs'
             ),
             'rf': RandomForestClassifier(
                 random_state=random_state, 
                 n_estimators=100, 
-                max_depth=None,
-                n_jobs=-1
+                max_depth=None
             ),
             'mlp': MLPClassifier(
                 random_state=random_state,
                 hidden_layer_sizes=(128, 64),
                 max_iter=500,
-                # Use the explicit train/test split from preprocessing instead of
-                # scikit-learn's internal validation split. For small MD datasets,
-                # early_stopping=True can trigger a stratified split with a
-                # validation set of size 1, which fails when there are only two
-                # classes and too few samples.
                 early_stopping=False
             )
         }
@@ -246,95 +340,74 @@ class FeatureEliminationLoop:
     """Orchestrates the iterative removal of highly correlated features."""
     
     def __init__(self, corr_threshold=0.90, accuracy_tolerance=0.05, min_features=10):
-        self.corr_threshold = corr_threshold
+        self.analyzer = CorrelationAnalyzer(threshold=corr_threshold)
         self.trainer = ModelTrainer()
         self.accuracy_tolerance = accuracy_tolerance
         self.min_features = min_features
         self.log = []
         
     def run(self, X_train, X_test, y_train, y_test, model_to_track='rf'):
-        logger.info("Starting Iterative Feature Elimination Loop (Optimized Batch Mode)")
+        """
+        Runs the iterative elimination loop.
+        Returns the final feature subset and the elimination log.
+        """
+        logger.info("Starting Iterative Feature Elimination Loop")
         
         current_X_train = X_train.copy()
         current_X_test = X_test.copy()
         
+        # Iteration 0: Baseline
         logger.info(f"--- ITERATION 0 (Baseline) | {current_X_train.shape[1]} features ---")
         metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
+        
         baseline_acc = metrics[model_to_track]['accuracy']
+        
         self._record_log(0, "None (Baseline)", current_X_train.shape[1], float('nan'), metrics)
         
         iteration = 1
         
-        logger.info("Computing initial correlation matrix (this might take a moment)...")
-        # Cache the correlation matrix
-        corr_matrix = current_X_train.corr().abs()
-        mean_corrs = corr_matrix.mean()
-        
+        # Initialize progress bar for the elimination loop
         total_to_drop = current_X_train.shape[1] - self.min_features
         pbar = tqdm(total=total_to_drop, desc="Eliminating Features", unit="feat")
         
         while current_X_train.shape[1] > self.min_features:
             logger.debug(f"--- ITERATION {iteration} | {current_X_train.shape[1]} features ---")
             
-            # Extract upper triangle to find unique pairs
-            upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+            # 1. Find most correlated pair
+            feat_A, feat_B, max_corr = self.analyzer.find_most_correlated_pair(current_X_train)
             
-            # Find all pairs with correlation > threshold
-            high_corr_pairs = upper_tri.stack()
-            high_corr_pairs = high_corr_pairs[high_corr_pairs > self.corr_threshold]
-            
-            if len(high_corr_pairs) == 0:
+            # Check stopping condition 1: No high correlations left
+            if feat_A is None:
                 logger.info("STOPPING: No highly correlated features remain.")
                 break
                 
-            # Sort by highest correlation
-            high_corr_pairs = high_corr_pairs.sort_values(ascending=False)
+            # 2. Decide which to drop
+            feat_to_drop = self.analyzer.get_feature_to_drop(current_X_train, feat_A, feat_B)
             
-            # Drop up to 100 features in a single batch
-            features_to_drop = set()
-            dropped_info = []
+            # 3. Drop it
+            current_X_train = current_X_train.drop(columns=[feat_to_drop])
+            current_X_test = current_X_test.drop(columns=[feat_to_drop])
             
-            for (feat_A, feat_B), corr_val in high_corr_pairs.items():
-                if len(features_to_drop) >= 100:
-                    break
-                    
-                if feat_A not in features_to_drop and feat_B not in features_to_drop:
-                    if mean_corrs[feat_A] > mean_corrs[feat_B]:
-                        features_to_drop.add(feat_A)
-                        dropped_info.append((feat_A, corr_val))
-                    else:
-                        features_to_drop.add(feat_B)
-                        dropped_info.append((feat_B, corr_val))
-                        
-            if not features_to_drop:
-                break
-                
-            features_to_drop = list(features_to_drop)
-            max_corr_in_batch = dropped_info[0][1]
-            
-            logger.info(f"Dropping {len(features_to_drop)} features in this batch (Max corr: {max_corr_in_batch:.4f})")
-            
-            current_X_train = current_X_train.drop(columns=features_to_drop)
-            current_X_test = current_X_test.drop(columns=features_to_drop)
-            
-            # Drop from cached matrix instead of recalculating
-            corr_matrix = corr_matrix.drop(index=features_to_drop, columns=features_to_drop)
-            mean_corrs = mean_corrs.drop(index=features_to_drop)
-            
+            # 4. Retrain and evaluate
             metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
             current_acc = metrics[model_to_track]['accuracy']
             
-            self._record_log(iteration, f"Batch of {len(features_to_drop)}", current_X_train.shape[1], max_corr_in_batch, metrics)
+            # 5. Log
+            self._record_log(iteration, feat_to_drop, current_X_train.shape[1], max_corr, metrics)
             
-            pbar.set_postfix({'acc': f"{current_acc:.2f}", 'corr': f"{max_corr_in_batch:.2f}"})
-            pbar.update(len(features_to_drop))
+            # Update progress bar
+            pbar.set_postfix({'acc': f"{current_acc:.2f}", 'corr': f"{max_corr:.2f}"})
+            pbar.update(1)
             
+            # Check stopping condition 2: Accuracy drop too large
             if (baseline_acc - current_acc) > self.accuracy_tolerance:
                 logger.warning(f"STOPPING: Accuracy dropped by more than tolerance " 
                                f"({baseline_acc:.4f} -> {current_acc:.4f}). "
                                f"Reverting last drop.")
-                current_X_train[features_to_drop] = X_train[features_to_drop]
-                current_X_test[features_to_drop] = X_test[features_to_drop]
+                # Revert the drop
+                current_X_train[feat_to_drop] = X_train[feat_to_drop]
+                current_X_test[feat_to_drop] = X_test[feat_to_drop]
+                # Remove the last log entry as it was reverted
                 self.log.pop()
                 break
                 
@@ -346,6 +419,7 @@ class FeatureEliminationLoop:
             logger.info(f"STOPPING: Reached minimum feature count ({self.min_features}).")
             
         logger.info(f"Elimination complete. Final feature count: {current_X_train.shape[1]}")
+        
         log_df = pd.DataFrame(self.log)
         return current_X_train.columns.tolist(), log_df
         
@@ -358,6 +432,7 @@ class FeatureEliminationLoop:
             'dropped_corr': corr_val
         }
         
+        # Flatten metrics into the log row
         for model_name, model_metrics in metrics.items():
             for metric_name, val in model_metrics.items():
                 entry[f"{model_name}_{metric_name}"] = val
