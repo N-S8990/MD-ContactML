@@ -33,8 +33,8 @@ def prepare_system(input_pdb, output_pdb):
     fixer.findNonstandardResidues()
     fixer.replaceNonstandardResidues()
     
-    logger.info("Removing heterogens (e.g., glycans, sugars) to avoid forcefield errors...")
-    fixer.removeHeterogens(True)
+    logger.info("Removing heterogens (including crystallographic water) for Implicit Solvent...")
+    fixer.removeHeterogens(False)
     
     logger.info("Adding missing sidechain atoms...")
     fixer.findMissingAtoms()
