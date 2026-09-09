@@ -272,12 +272,14 @@ class ModelTrainer:
             'lr': LogisticRegression(
                 random_state=random_state, 
                 max_iter=1000, 
-                solver='lbfgs'
+                solver='lbfgs',
+                n_jobs=-1
             ),
             'rf': RandomForestClassifier(
                 random_state=random_state, 
                 n_estimators=100, 
-                max_depth=None
+                max_depth=None,
+                n_jobs=-1
             ),
             'mlp': MLPClassifier(
                 random_state=random_state,
