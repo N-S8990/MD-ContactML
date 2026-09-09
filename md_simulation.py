@@ -25,8 +25,9 @@ def prepare_system(input_pdb, output_pdb):
     logger.info(f"Preparing system from {input_pdb}...")
     fixer = PDBFixer(filename=input_pdb)
     
-    logger.info("Finding missing residues...")
+    logger.info("Finding missing residues (and ignoring them to prevent massive box sizes)...")
     fixer.findMissingResidues()
+    fixer.missingResidues = {}
     
     logger.info("Finding nonstandard residues...")
     fixer.findNonstandardResidues()
