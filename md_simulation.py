@@ -90,7 +90,7 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     simulation.context.setPositions(positions)
     
     logger.info(f"Minimizing energy ...")
-    simulation.minimizeEnergy(tolerance=1.0*unit.kilojoule/unit.mole, maxIterations=max_min_iters)
+    simulation.minimizeEnergy(tolerance=1.0 * unit.kilojoules_per_mole / unit.nanometer, maxIterations=max_min_iters)
 
     if seed is None:
         simulation.context.setVelocitiesToTemperature(10 * unit.kelvin)
