@@ -110,9 +110,19 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     dcd_path = os.path.join(out_dir, f"{prefix}_traj.dcd")
     log_path = os.path.join(out_dir, f"{prefix}_sim.log")
     
+    # Save trajectory to DCD
     simulation.reporters.append(app.DCDReporter(dcd_path, max(1, report_interval)))
-    simulation.reporters.append(app.StateDataReporter(log_path, max(1, steps // 10), step=True, 
-                                                      potentialEnergy=True, temperature=True, volume=True))
+    
+    # Save detailed stats to log file
+    simulation.reporters.append(app.StateDataReporter(log_path, max(1, report_interval), step=True, 
+                                                      potentialEnergy=True, temperature=True))
+                                                      
+    # Print beautiful progress to the terminal (stdout)
+    print_interval = max(1, steps // 100) # Print progress 100 times during the run
+    simulation.reporters.append(app.StateDataReporter(sys.stdout, print_interval, step=True, 
+                                                      potentialEnergy=True, temperature=True, 
+                                                      progress=True, remainingTime=True, 
+                                                      speed=True, totalSteps=steps, separator='\t'))
                                                       
     logger.info(f"Running simulation for {steps} steps...")
     simulation.step(steps)
