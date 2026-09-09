@@ -59,7 +59,7 @@ def prepare_system(input_pdb, output_pdb):
     return fixer.topology, fixer.positions
 
 def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_name=None,
-                   max_min_iters=0, seed=None, report_interval=50000):
+                   max_min_iters=0, seed=None, report_interval=50000, temperature=300):
     logger.info("Setting up simulation parameters...")
     
     # Use amber14 forcefield with Implicit Solvent (GBn2)
@@ -70,22 +70,17 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
                                      constraints=app.HBonds)
                                      
     # Langevin integrator with 1fs timestep for stability
-    integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.001*unit.picoseconds)
-    if seed is not None:
-        integrator.setRandomNumberSeed(seed)
+    integrator = mm.LangevinMiddleIntegrator(temperature * unit.kelvin, 1.0/unit.picosecond, 0.001*unit.picoseconds)
     
-    # Try to use hardware acceleration if specified or available
+    platform = None
     if platform_name:
         try:
             platform = mm.Platform.getPlatformByName(platform_name)
-            simulation = app.Simulation(topology, system, integrator, platform)
             logger.info(f"Using platform: {platform_name}")
         except Exception as e:
-            logger.warning(f"Failed to use platform {platform_name}: {e}. Falling back to default.")
-            simulation = app.Simulation(topology, system, integrator)
-    else:
-        simulation = app.Simulation(topology, system, integrator)
-        
+            logger.warning(f"Could not load platform {platform_name}: {e}. Using default.")
+            
+    simulation = app.Simulation(topology, system, integrator, platform)
     simulation.context.setPositions(positions)
     
     logger.info(f"Minimizing energy ...")
@@ -100,9 +95,9 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     integrator.setStepSize(0.0001 * unit.picoseconds) # Extremely small timestep (0.1 fs)
     simulation.step(1000)
     
-    # Heat up to 300K
-    integrator.setTemperature(300 * unit.kelvin)
-    simulation.context.setVelocitiesToTemperature(300 * unit.kelvin)
+    # Heat up to target temperature
+    integrator.setTemperature(temperature * unit.kelvin)
+    simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)
     integrator.setStepSize(0.001 * unit.picoseconds) # Normal stable timestep (1 fs)
     
     # Setup reporters
@@ -124,7 +119,7 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
                                                       progress=True, remainingTime=True, 
                                                       speed=True, totalSteps=steps, separator='\t'))
                                                       
-    logger.info(f"Running simulation for {steps} steps...")
+    logger.info(f"Running simulation for {steps} steps at {temperature}K...")
     simulation.step(steps)
     logger.info(f"Simulation complete. Trajectory saved to {dcd_path}")
 
@@ -141,6 +136,7 @@ def main():
                         help="Random seed; use a different seed for every independent replica.")
     parser.add_argument("--report_interval", type=int, default=50000,
                         help="Save one DCD frame every N steps (50,000 = 100 ps at 2 fs timestep).")
+    parser.add_argument("--temperature", type=int, default=300, help="Simulation temperature in Kelvin")
     
     args = parser.parse_args()
     
@@ -152,7 +148,7 @@ def main():
     
     topology, positions = prepare_system(args.input_pdb, prep_pdb)
     run_simulation(topology, positions, args.out_dir, args.prefix, args.steps, args.platform,
-                   args.max_min_iters, args.seed, args.report_interval)
+                   args.max_min_iters, args.seed, args.report_interval, args.temperature)
 
 if __name__ == "__main__":
     main()
