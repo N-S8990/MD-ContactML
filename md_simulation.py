@@ -40,14 +40,13 @@ def prepare_system(input_pdb, output_pdb):
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
     
-
     logger.info("Adding missing hydrogens...")
     fixer.addMissingHydrogens(7.0)
     
-    logger.info("Solvating system...")
-    fixer.addSolvent(padding=1.0 * unit.nanometers, ionicStrength=0.15 * unit.molar)
+    logger.info("Skipping explicit solvation! Using Implicit Solvent to prevent Segfaults/OOM...")
+    # fixer.addSolvent is removed.
     
-    logger.info("Centering molecule and water padding at (0,0,0)...")
+    logger.info("Centering molecule at (0,0,0)...")
     positions = np.array(fixer.positions.value_in_unit(unit.nanometers))
     center = np.mean(positions, axis=0)
     positions -= center
@@ -63,11 +62,11 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
                    max_min_iters=0, seed=None, report_interval=50000):
     logger.info("Setting up simulation parameters...")
     
-    # Use amber14 forcefield
-    forcefield = app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
+    # Use amber14 forcefield with Implicit Solvent (GBn2)
+    forcefield = app.ForceField('amber14-all.xml', 'implicit/gbn2.xml')
     
-    system = forcefield.createSystem(topology, nonbondedMethod=app.PME, 
-                                     nonbondedCutoff=1.0*unit.nanometer,
+    # No PME or Cutoff for Implicit Solvent
+    system = forcefield.createSystem(topology, nonbondedMethod=app.NoCutoff, 
                                      constraints=app.HBonds)
                                      
     # Langevin integrator with 1fs timestep for stability
