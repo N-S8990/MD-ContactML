@@ -90,12 +90,21 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     simulation.context.setPositions(positions)
     
     logger.info(f"Minimizing energy ...")
-    simulation.minimizeEnergy(maxIterations=max_min_iters)
+    simulation.minimizeEnergy(tolerance=1.0*unit.kilojoule/unit.mole, maxIterations=max_min_iters)
 
     if seed is None:
-        simulation.context.setVelocitiesToTemperature(300 * unit.kelvin)
+        simulation.context.setVelocitiesToTemperature(10 * unit.kelvin)
     else:
-        simulation.context.setVelocitiesToTemperature(300 * unit.kelvin, seed)
+        simulation.context.setVelocitiesToTemperature(10 * unit.kelvin, seed)
+        
+    logger.info("Warming up the system gently...")
+    integrator.setStepSize(0.0001 * unit.picoseconds) # Extremely small timestep (0.1 fs)
+    simulation.step(1000)
+    
+    # Heat up to 300K
+    integrator.setTemperature(300 * unit.kelvin)
+    simulation.context.setVelocitiesToTemperature(300 * unit.kelvin)
+    integrator.setStepSize(0.001 * unit.picoseconds) # Normal stable timestep (1 fs)
     
     # Setup reporters
     os.makedirs(out_dir, exist_ok=True)
