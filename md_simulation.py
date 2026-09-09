@@ -88,13 +88,14 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
         simulation = app.Simulation(topology, system, integrator)
         
     simulation.context.setPositions(positions)
+    
+    logger.info(f"Minimizing energy ...")
+    simulation.minimizeEnergy(maxIterations=max_min_iters)
+
     if seed is None:
         simulation.context.setVelocitiesToTemperature(300 * unit.kelvin)
     else:
         simulation.context.setVelocitiesToTemperature(300 * unit.kelvin, seed)
-    
-    logger.info(f"Minimizing energy ...")
-    simulation.minimizeEnergy(maxIterations=max_min_iters)
     
     # Setup reporters
     os.makedirs(out_dir, exist_ok=True)
