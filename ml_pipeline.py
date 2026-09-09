@@ -208,53 +208,45 @@ class CorrelationAnalyzer:
     def __init__(self, threshold=0.90):
         self.threshold = threshold
         
-    def find_most_correlated_pair(self, X_train):
+    def get_features_to_drop_batch(self, X_train, batch_size=50):
         """
-        Finds the pair of features with the highest absolute Pearson correlation.
-        Returns the pair and their correlation value, or None if max corr < threshold.
+        Finds a batch of features to drop that are highly correlated.
         """
         if not isinstance(X_train, pd.DataFrame):
-            raise ValueError("X_train must be a pandas DataFrame to compute correlations with feature names.")
+            raise ValueError("X_train must be a pandas DataFrame.")
             
         logger.info(f"Computing correlation matrix for {X_train.shape[1]} features...")
-        
-        # Compute correlation matrix
         corr_matrix = X_train.corr().abs()
-        
-        # Extract upper triangle without diagonal to find unique pairs
         upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
         
-        # Find the max correlation value
-        max_corr = upper_tri.max().max()
-        
-        if pd.isna(max_corr) or max_corr < self.threshold:
-            logger.info(f"No feature pairs found with correlation >= {self.threshold} (max is {max_corr:.4f}).")
-            return None, None, max_corr
+        high_corr_mask = upper_tri >= self.threshold
+        if not high_corr_mask.any().any():
+            return [], 0.0
             
-        # Get the feature names for the maximum correlation
-        # argmax() flattens the matrix, so we unravel it to get 2D indices
-        idx = np.unravel_index(np.nanargmax(upper_tri.values), upper_tri.shape)
-        feat_A = upper_tri.index[idx[0]]
-        feat_B = upper_tri.columns[idx[1]]
+        pairs = np.argwhere(high_corr_mask.values)
+        corrs = [upper_tri.iloc[r, c] for r, c in pairs]
+        sorted_indices = np.argsort(corrs)[::-1]
         
-        logger.info(f"Highest correlation found: {feat_A} and {feat_B} (corr = {max_corr:.4f})")
-        return feat_A, feat_B, max_corr
+        features_to_drop = set()
+        mean_corrs = corr_matrix.mean()
         
-    def get_feature_to_drop(self, X_train, feat_A, feat_B):
-        """
-        Given a highly correlated pair, decides which one to drop.
-        Drops the one that has a higher average absolute correlation with ALL other features.
-        """
-        # Calculate mean absolute correlation with all other features
-        corr_A = X_train.corrwith(X_train[feat_A]).abs().mean()
-        corr_B = X_train.corrwith(X_train[feat_B]).abs().mean()
+        max_corr_found = corrs[sorted_indices[0]]
         
-        if corr_A > corr_B:
-            logger.info(f"Dropping {feat_A} (avg corr: {corr_A:.4f}) over {feat_B} (avg corr: {corr_B:.4f})")
-            return feat_A
-        else:
-            logger.info(f"Dropping {feat_B} (avg corr: {corr_B:.4f}) over {feat_A} (avg corr: {corr_A:.4f})")
-            return feat_B
+        for idx in sorted_indices:
+            r, c = pairs[idx]
+            feat_A = upper_tri.index[r]
+            feat_B = upper_tri.columns[c]
+            
+            if feat_A not in features_to_drop and feat_B not in features_to_drop:
+                if mean_corrs[feat_A] > mean_corrs[feat_B]:
+                    features_to_drop.add(feat_A)
+                else:
+                    features_to_drop.add(feat_B)
+                    
+            if len(features_to_drop) >= batch_size:
+                break
+                
+        return list(features_to_drop), max_corr_found
 
 
 # MODEL TRAIN
@@ -322,7 +314,6 @@ class ModelTrainer:
                 try:
                     roc_auc = roc_auc_score(y_test, y_prob)
                 except ValueError:
-                    # In case only one class is present in y_test (rare in stratified split)
                     roc_auc = float('nan')
             else:
                 roc_auc = float('nan')
@@ -363,87 +354,74 @@ class FeatureEliminationLoop:
         current_X_train = X_train.copy()
         current_X_test = X_test.copy()
         
-        # Iteration 0: Baseline
+        # Iteration 0: Baseline (Train ALL models)
         logger.info(f"--- ITERATION 0 (Baseline) | {current_X_train.shape[1]} features ---")
         metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
         
         baseline_acc = metrics[model_to_track]['accuracy']
-        
         self._record_log(0, "None (Baseline)", current_X_train.shape[1], float('nan'), metrics)
         
         iteration = 1
-        
-        # Initialize progress bar for the elimination loop
         total_to_drop = current_X_train.shape[1] - self.min_features
         pbar = tqdm(total=total_to_drop, desc="Eliminating Features", unit="feat")
+        
+        batch_size = 50 # Drop up to 50 features at a time to vastly speed up execution
         
         while current_X_train.shape[1] > self.min_features:
             logger.debug(f"--- ITERATION {iteration} | {current_X_train.shape[1]} features ---")
             
-            # 1. Find most correlated pair
-            feat_A, feat_B, max_corr = self.analyzer.find_most_correlated_pair(current_X_train)
+            # 1. Find batch of correlated features to drop
+            features_to_drop, max_corr = self.analyzer.get_features_to_drop_batch(current_X_train, batch_size=batch_size)
             
-            # Check stopping condition 1: No high correlations left
-            if feat_A is None:
+            if not features_to_drop:
                 logger.info("STOPPING: No highly correlated features remain.")
                 break
                 
-            # 2. Decide which to drop
-            feat_to_drop = self.analyzer.get_feature_to_drop(current_X_train, feat_A, feat_B)
+            # 2. Drop them
+            current_X_train = current_X_train.drop(columns=features_to_drop)
+            current_X_test = current_X_test.drop(columns=features_to_drop)
             
-            # 3. Drop it
-            current_X_train = current_X_train.drop(columns=[feat_to_drop])
-            current_X_test = current_X_test.drop(columns=[feat_to_drop])
-            
-            # 4. Retrain and evaluate
-            metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
+            # 3. Retrain ONLY the tracking model for speed
+            metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test, models_to_run=[model_to_track])
             current_acc = metrics[model_to_track]['accuracy']
             
-            # 5. Log
-            self._record_log(iteration, feat_to_drop, current_X_train.shape[1], max_corr, metrics)
+            # 4. Log (just record the first dropped feature name to save space)
+            self._record_log(iteration, features_to_drop[0] + f" (+{len(features_to_drop)-1} more)", current_X_train.shape[1], max_corr, metrics)
             
-            # Update progress bar
             pbar.set_postfix({'acc': f"{current_acc:.2f}", 'corr': f"{max_corr:.2f}"})
-            pbar.update(1)
+            pbar.update(len(features_to_drop))
             
-            # Check stopping condition 2: Accuracy drop too large
             if (baseline_acc - current_acc) > self.accuracy_tolerance:
-                logger.warning(f"STOPPING: Accuracy dropped by more than tolerance " 
-                               f"({baseline_acc:.4f} -> {current_acc:.4f}). "
-                               f"Reverting last drop.")
-                # Revert the drop
-                current_X_train[feat_to_drop] = X_train[feat_to_drop]
-                current_X_test[feat_to_drop] = X_test[feat_to_drop]
-                # Remove the last log entry as it was reverted
+                logger.warning(f"STOPPING: Accuracy dropped by more than tolerance. Reverting last batch.")
+                current_X_train[features_to_drop] = X_train[features_to_drop]
+                current_X_test[features_to_drop] = X_test[features_to_drop]
                 self.log.pop()
                 break
                 
             iteration += 1
             
         pbar.close()
-            
-        if current_X_train.shape[1] <= self.min_features:
-            logger.info(f"STOPPING: Reached minimum feature count ({self.min_features}).")
-            
+        
         logger.info(f"Elimination complete. Final feature count: {current_X_train.shape[1]}")
+        
+        # Train ALL models one final time on the optimized feature set
+        logger.info(f"--- FINAL EVALUATION | {current_X_train.shape[1]} features ---")
+        final_metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
+        self._record_log(iteration, "FINAL", current_X_train.shape[1], float('nan'), final_metrics)
         
         log_df = pd.DataFrame(self.log)
         return current_X_train.columns.tolist(), log_df
         
     def _record_log(self, iteration, dropped_feature, num_features, corr_val, metrics):
-        """Helper to structure the log dictionary."""
         entry = {
             'iteration': iteration,
             'dropped_feature': dropped_feature,
             'remaining_features': num_features,
             'dropped_corr': corr_val
         }
-        
-        # Flatten metrics into the log row
         for model_name, model_metrics in metrics.items():
             for metric_name, val in model_metrics.items():
                 entry[f"{model_name}_{metric_name}"] = val
-                
         self.log.append(entry)
 
 
