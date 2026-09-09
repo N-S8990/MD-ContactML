@@ -148,32 +148,37 @@ class MDPreprocessor:
                 logger.warning(f"Found {X.isna().sum().sum()} missing values. Filling with column means.")
                 X = X.fillna(X.mean())
         
-        # 2. Hold out entire trajectories. Random frame-level splits would put highly
-        # correlated snapshots from one replica in both train and test sets.
+        # 2. Hold out entire trajectories or do frame split
         groups = np.asarray(groups)
         y = np.asarray(y)
-        class_group_counts = [len(np.unique(groups[y == label])) for label in np.unique(y)]
-        if len(class_group_counts) != 2 or min(class_group_counts) < self.n_splits:
-            raise ValueError(
-                f"Replica-aware evaluation needs at least {self.n_splits} independent "
-                f"trajectories per class; found {class_group_counts}."
+        
+        if self.n_splits == 1:
+            logger.warning("cv_folds=1 detected. Using standard 80/20 random frame split. (Note: Frame splitting can cause data leakage in time-series MD data)")
+            from sklearn.model_selection import train_test_split
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=self.random_state)
+        else:
+            class_group_counts = [len(np.unique(groups[y == label])) for label in np.unique(y)]
+            if len(class_group_counts) != 2 or min(class_group_counts) < self.n_splits:
+                raise ValueError(
+                    f"Replica-aware evaluation needs at least {self.n_splits} independent "
+                    f"trajectories per class; found {class_group_counts}. To bypass, use --cv_folds 1"
+                )
+            if not 0 <= self.test_fold < self.n_splits:
+                raise ValueError(f"test_fold must be between 0 and {self.n_splits - 1}.")
+            splitter = StratifiedGroupKFold(
+                n_splits=self.n_splits, shuffle=True, random_state=self.random_state
             )
-        if not 0 <= self.test_fold < self.n_splits:
-            raise ValueError(f"test_fold must be between 0 and {self.n_splits - 1}.")
-        splitter = StratifiedGroupKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=self.random_state
-        )
-        splits = splitter.split(X, y, groups)
-        for fold_index, (train_idx, test_idx) in enumerate(splits):
-            if fold_index == self.test_fold:
-                break
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        logger.info(
-            "Replica-aware split %s: %s train replicas, %s held-out replicas.",
-            self.test_fold,
-            len(np.unique(groups[train_idx])), len(np.unique(groups[test_idx]))
-        )
+            splits = splitter.split(X, y, groups)
+            for fold_index, (train_idx, test_idx) in enumerate(splits):
+                if fold_index == self.test_fold:
+                    break
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            logger.info(
+                "Replica-aware split %s: %s train replicas, %s held-out replicas.",
+                self.test_fold,
+                len(np.unique(groups[train_idx])), len(np.unique(groups[test_idx]))
+            )
         
         # 3. Standardization (fit ONLY on train to avoid data leakage)
         logger.info("Scaling features...")

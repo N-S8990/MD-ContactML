@@ -49,8 +49,8 @@ def main():
     shared_paths = class0_paths & class1_paths
     if shared_paths:
         parser.error("A trajectory cannot appear in both classes: " + ", ".join(map(str, shared_paths)))
-    if len(args.class0_traj) < args.cv_folds or len(args.class1_traj) < args.cv_folds:
-        parser.error(f"Provide at least {args.cv_folds} independent trajectories for each class.")
+    if args.cv_folds > 1 and (len(args.class0_traj) < args.cv_folds or len(args.class1_traj) < args.cv_folds):
+        parser.error(f"For cv_folds={args.cv_folds}, provide at least {args.cv_folds} independent trajectories for each class. Or use --cv_folds 1 for a single trajectory per class.")
     
     if os.path.exists(args.out_dir):
         logger.info(f"Removing older results in {args.out_dir}...")
