@@ -25,9 +25,8 @@ def prepare_system(input_pdb, output_pdb):
     logger.info(f"Preparing system from {input_pdb}...")
     fixer = PDBFixer(filename=input_pdb)
     
-    logger.info("Finding missing residues (and ignoring them to prevent massive box sizes)...")
+    logger.info("Finding missing residues...")
     fixer.findMissingResidues()
-    fixer.missingResidues = {}
     
     logger.info("Finding nonstandard residues...")
     fixer.findNonstandardResidues()
@@ -70,8 +69,8 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
                                      nonbondedCutoff=1.0*unit.nanometer,
                                      constraints=app.HBonds)
                                      
-    # Langevin integrator
-    integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
+    # Langevin integrator with 1fs timestep for stability
+    integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.001*unit.picoseconds)
     if seed is not None:
         integrator.setRandomNumberSeed(seed)
     
