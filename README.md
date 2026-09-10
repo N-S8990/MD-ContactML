@@ -166,22 +166,6 @@ python run_pipeline.py \
 | `--test_fold` | `0` | Which replica-aware fold is held out for the reported score |
 | `--out_dir` | `results` | Base directory for auto-incrementing result folders (`result_1`, `result_2`, ...) |
 
-### 6. Automated Temperature Sweep
-
-To automatically simulate a complex at multiple temperatures and train the machine learning model to distinguish stable (colder) states from unfolding (hotter) states, use the provided wrapper scripts:
-
-1. **Run the Simulations**:
-   ```bash
-   python run_temperature_sweep.py
-   ```
-   This will simulate the complex at 300K and 400K, generating high-density frames (`--report_interval 1000`).
-
-2. **Train the ML Model**:
-   ```bash
-   ./train_temperature_sweep.sh
-   ```
-   This automatically routes the 300K trajectory to Class 0 and the 400K trajectory to Class 1. It utilizes tightened criteria (`--acc_tolerance 0.02`) and skips redundant frames (`--frame_stride 10`) to find the core structural contacts that break down under thermal stress.
-
 ---
 
 ## 🤖 Machine Learning Models
