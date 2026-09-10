@@ -79,6 +79,9 @@ conda env create -f environment.yml
 conda activate md-contactml
 ```
 
+> [!NOTE]
+> The single `environment.yml` file uses platform selectors to dynamically install GPU-accelerated dependencies on supported systems, while automatically falling back to CPU-only dependencies on others.
+
 > [!TIP]
 > If you cannot use Conda, you can still install the python dependencies using `pip install -r requirements.txt`, but you will need to install OpenMM and PDBFixer manually.
 
