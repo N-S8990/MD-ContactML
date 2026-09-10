@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import shutil
+import time
 import pandas as pd
 from pathlib import Path
 
@@ -9,7 +10,8 @@ from ml_pipeline import (
     MDFeatureExtractor,
     MDPreprocessor,
     FeatureEliminationLoop,
-    PipelineVisualizer
+    PipelineVisualizer,
+    HAS_CUML
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -39,6 +41,10 @@ def main():
                         help="Number of replica-aware folds; requires this many replicas per class.")
     parser.add_argument("--test_fold", type=int, default=0,
                         help="Which replica-aware fold to reserve for testing (0-based).")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel workers for trajectory feature extraction.")
+    parser.add_argument("--initial-features", type=int, default=None,
+                        help="Optional: Pre-filter to N closest features based on mean distance before correlation elimination.")
     
     parser.add_argument("--out_dir", type=str, default="results", help="Base output directory")
     
@@ -62,6 +68,7 @@ def main():
     logger.info(f"Saving results to {args.out_dir}")
     
     logger.info("=== Phase 1: Feature Extraction ===")
+    t0 = time.time()
     extractor = MDFeatureExtractor(
         target1_selection=args.target1_selection,
         target2_selection=args.target2_selection,
@@ -70,30 +77,37 @@ def main():
     )
     X, y, groups = extractor.build_dataset(
         args.class0_top, args.class0_traj, args.class1_top, args.class1_traj,
-        max_frames=args.max_frames, frame_stride=args.frame_stride
+        max_frames=args.max_frames, frame_stride=args.frame_stride, workers=args.workers
     )
-    
-    # Keep the top 5000 features representing the closest atom pairs (the actual interface)
-    # logger.info("Selecting the 5000 closest interacting atom pairs to use as features...")
-    # mean_distances = X.mean()
-    # closest_5000_cols = mean_distances.nsmallest(1000).index
-    # X = X[closest_5000_cols]
+    t_extract = time.time() - t0
     
     # Save original features for reference
     X_orig = X.copy()
+    original_feature_count = X.shape[1]
     
     logger.info("=== Phase 2: Preprocessing ===")
-    preprocessor = MDPreprocessor(n_splits=args.cv_folds, test_fold=args.test_fold)
-    X_train, X_test, y_train, y_test = preprocessor.preprocess(X, y, groups)
+    t0 = time.time()
+    preprocessor = MDPreprocessor(n_splits=args.cv_folds, test_fold=args.test_fold, initial_features=getattr(args, 'initial_features', None))
+    X_train, X_test, y_train, y_test, groups_train, groups_test = preprocessor.preprocess(X, y, groups)
+    t_preprocess = time.time() - t0
     
-    logger.info("=== Phase 3 & 4: Iterative Elimination Loop ===")
+    initial_feature_count = getattr(args, 'initial_features', None) if getattr(args, 'initial_features', None) is not None else original_feature_count
+    
+    logger.info("=== Phase 3: Model Setup & Hyperparameter Search ===")
+    t0 = time.time()
     loop = FeatureEliminationLoop(
         corr_threshold=args.corr_threshold,
         accuracy_tolerance=args.acc_tolerance,
         min_features=args.min_features
     )
+    # Tune hyperparameters on the training data BEFORE elimination
+    loop.trainer.tune_hyperparameters(X_train, y_train, groups=groups_train, cv_folds=args.cv_folds)
+    t_tune = time.time() - t0
     
-    final_features, log_df = loop.run(X_train, X_test, y_train, y_test, model_to_track='rf')
+    logger.info("=== Phase 4: Iterative Elimination Loop ===")
+    t0 = time.time()
+    final_features, log_df = loop.run(X_train, y_train, groups_train, X_test, y_test, model_to_track='rf', cv_folds=args.cv_folds)
+    t_eliminate = time.time() - t0
     
     # Save logs
     log_path = os.path.join(args.out_dir, "elimination_log.csv")
@@ -105,29 +119,51 @@ def main():
     final_features_path = os.path.join(args.out_dir, "final_features.csv")
     final_features_df.to_csv(final_features_path, index=False)
     logger.info(f"Saved final features to {final_features_path}")
-        
-    # Extract final accuracy and recall
-    final_acc = log_df.iloc[-1]['rf_accuracy']
-    final_recall = log_df.iloc[-1]['rf_recall']
     
-    score_text = f"Final Model Scores (Random Forest):\nAccuracy: {final_acc:.4f}\nRecall: {final_recall:.4f}\n"
-    logger.info(f"\n{'-'*40}\n{score_text}{'-'*40}")
-    
-    final_scores_path = os.path.join(args.out_dir, "final_scores.txt")
-    with open(final_scores_path, "w") as f:
-        f.write(score_text)
-    logger.info(f"Saved final scores to {final_scores_path}")
-        
     logger.info("=== Phase 5: Visualization ===")
     vis = PipelineVisualizer(output_dir=os.path.join(args.out_dir, "figures"))
-    
-    # Plot accuracy curve
     vis.plot_accuracy_vs_features(log_df)
-    
-
-    
-    # Heatmaps (before vs after)
     vis.plot_correlation_heatmap(X_orig[final_features], "Final Feature Correlation Matrix", "heatmap_after.png")
+    
+    logger.info("=== BENCHMARK & PERFORMANCE REPORT ===")
+    
+    final_row = log_df.iloc[-1]
+    
+    report = [
+        "TIMING:",
+        f"Feature Extraction Time:  {t_extract:.2f}s",
+        f"Preprocessing Time:       {t_preprocess:.2f}s",
+        f"Hyperparameter Tuning:    {t_tune:.2f}s",
+        f"Feature Elimination Time: {t_eliminate:.2f}s",
+        f"Total Pipeline Time:      {t_extract + t_preprocess + t_tune + t_eliminate:.2f}s",
+        "",
+        "CONFIGURATION:",
+        f"Workers:                  {args.workers}",
+        f"cuML / GPU RF Available:  {HAS_CUML}",
+        f"RF Params:                {loop.trainer.models['rf'].get_params() if not HAS_CUML else 'cuML defaults'}",
+        f"Original Features:        {original_feature_count}",
+        f"Initial Features Used:    {initial_feature_count}",
+        f"Final Features Selected:  {len(final_features)}",
+        "",
+        "FINAL METRICS (TEST SET):"
+    ]
+    
+    for model_key in ['rf', 'lr', 'mlp']:
+        report.append(f"  {model_key.upper()}:")
+        report.append(f"    Accuracy:          {final_row.get(f'{model_key}_accuracy', float('nan')):.4f}")
+        report.append(f"    Balanced Accuracy: {final_row.get(f'{model_key}_balanced_accuracy', float('nan')):.4f}")
+        report.append(f"    Precision:         {final_row.get(f'{model_key}_precision', float('nan')):.4f}")
+        report.append(f"    Recall:            {final_row.get(f'{model_key}_recall', float('nan')):.4f}")
+        report.append(f"    F1:                {final_row.get(f'{model_key}_f1_score', float('nan')):.4f}")
+        report.append(f"    ROC-AUC:           {final_row.get(f'{model_key}_roc_auc', float('nan')):.4f}")
+    
+    score_text = "\n".join(report)
+    logger.info(f"\n{'-'*50}\n{score_text}\n{'-'*50}")
+    
+    final_scores_path = os.path.join(args.out_dir, "benchmark_report.txt")
+    with open(final_scores_path, "w") as f:
+        f.write(score_text)
+    logger.info(f"Saved benchmark report to {final_scores_path}")
     
     logger.info("=== Pipeline Complete ===")
 

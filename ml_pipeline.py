@@ -1,8 +1,8 @@
 from MDAnalysis.analysis import distances
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, recall_score
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, recall_score, balanced_accuracy_score, precision_score
+from sklearn.model_selection import StratifiedGroupKFold, RandomizedSearchCV
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
@@ -13,6 +13,14 @@ import numpy as np
 import os
 import pandas as pd
 import seaborn as sns
+import concurrent.futures
+
+try:
+    from cuml.ensemble import RandomForestClassifier as GPU_RF  # type: ignore
+    HAS_CUML = True
+except Exception as e:
+    GPU_RF = RandomForestClassifier
+    HAS_CUML = False
 
 
 # FEATURE EXTRACTION
@@ -71,7 +79,7 @@ class MDFeatureExtractor:
             raise ValueError(f"Trajectory {trajectory} contains no frames to extract.")
         logger.info(f"Extracting features across {n_frames} frames...")
         
-        features = np.zeros((n_frames, len(target1_atoms) * len(target2_atoms)))
+        features = np.zeros((n_frames, len(target1_atoms) * len(target2_atoms)), dtype=np.float32)
         
         for frame_index, trajectory_index in enumerate(frame_indices):
             u.trajectory[trajectory_index]
@@ -83,27 +91,41 @@ class MDFeatureExtractor:
         return pd.DataFrame(features, columns=feature_names), np.full(n_frames, label)
 
     def build_dataset(self, topology1, trajectories1, topology2, trajectories2,
-                      max_frames=None, frame_stride=1):
+                      max_frames=None, frame_stride=1, workers=1):
         """Build a labeled dataset from two groups of trajectories."""
         feature_frames = []
         labels = []
         groups = []
 
-        for trajectory_index, trajectory in enumerate(trajectories1):
-            trajectory_features, trajectory_labels = self._extract_distances(
-                topology1, trajectory, label=0, max_frames=max_frames, frame_stride=frame_stride
-            )
-            feature_frames.append(trajectory_features)
-            labels.append(trajectory_labels)
-            groups.append(np.full(len(trajectory_labels), f"class0_replica_{trajectory_index}"))
+        tasks = []
+        # Create a list of all jobs
+        for i, traj in enumerate(trajectories1):
+            tasks.append((topology1, traj, 0, max_frames, frame_stride, f"class0_replica_{i}"))
+        for i, traj in enumerate(trajectories2):
+            tasks.append((topology2, traj, 1, max_frames, frame_stride, f"class1_replica_{i}"))
 
-        for trajectory_index, trajectory in enumerate(trajectories2):
-            trajectory_features, trajectory_labels = self._extract_distances(
-                topology2, trajectory, label=1, max_frames=max_frames, frame_stride=frame_stride
-            )
-            feature_frames.append(trajectory_features)
-            labels.append(trajectory_labels)
-            groups.append(np.full(len(trajectory_labels), f"class1_replica_{trajectory_index}"))
+        if workers > 1:
+            logger.info(f"Extracting features using {workers} workers...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = []
+                for top, traj, label, mf, fs, group_name in tasks:
+                    futures.append(
+                        executor.submit(self._extract_distances, top, traj, label, mf, fs)
+                    )
+                
+                for future, task in zip(futures, tasks):
+                    traj_features, traj_labels = future.result()
+                    group_name = task[5]
+                    feature_frames.append(traj_features)
+                    labels.append(traj_labels)
+                    groups.append(np.full(len(traj_labels), group_name))
+        else:
+            logger.info("Extracting features sequentially...")
+            for top, traj, label, mf, fs, group_name in tasks:
+                traj_features, traj_labels = self._extract_distances(top, traj, label, mf, fs)
+                feature_frames.append(traj_features)
+                labels.append(traj_labels)
+                groups.append(np.full(len(traj_labels), group_name))
 
         if not feature_frames:
             raise ValueError("At least one trajectory is required for each dataset group.")
@@ -131,22 +153,24 @@ logger = logging.getLogger(__name__)
 class MDPreprocessor:
     """Preprocesses MD feature data for ML models."""
     
-    def __init__(self, n_splits=3, test_fold=0, random_state=42):
+    def __init__(self, n_splits=3, test_fold=0, random_state=42, initial_features=None):
         self.n_splits = n_splits
         self.test_fold = test_fold
         self.random_state = random_state
+        self.initial_features = initial_features
         self.scaler = StandardScaler()
         
     def preprocess(self, X, y, groups):
         """Cleans, splits by replica, and scales the dataset without leakage."""
         logger.info("Preprocessing data...")
         
-        # 1. Clean data (handle NaN/Inf)
+        # 1. Clean data and cast to float32
         if isinstance(X, pd.DataFrame):
             X = X.replace([np.inf, -np.inf], np.nan)
             if X.isna().sum().sum() > 0:
                 logger.warning(f"Found {X.isna().sum().sum()} missing values. Filling with column means.")
                 X = X.fillna(X.mean())
+            X = X.astype(np.float32)
         
         # 2. Hold out entire trajectories or do frame split
         groups = np.asarray(groups)
@@ -155,7 +179,7 @@ class MDPreprocessor:
         if self.n_splits == 1:
             logger.warning("cv_folds=1 detected. Using standard 80/20 random frame split. (Note: Frame splitting can cause data leakage in time-series MD data)")
             from sklearn.model_selection import train_test_split
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=self.random_state)
+            X_train, X_test, y_train, y_test, groups_train, groups_test = train_test_split(X, y, groups, test_size=0.2, stratify=y, random_state=self.random_state)
         else:
             class_group_counts = [len(np.unique(groups[y == label])) for label in np.unique(y)]
             if len(class_group_counts) != 2 or min(class_group_counts) < self.n_splits:
@@ -174,28 +198,38 @@ class MDPreprocessor:
                     break
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
+            groups_train, groups_test = groups[train_idx], groups[test_idx]
             logger.info(
                 "Replica-aware split %s: %s train replicas, %s held-out replicas.",
                 self.test_fold,
-                len(np.unique(groups[train_idx])), len(np.unique(groups[test_idx]))
+                len(np.unique(groups_train)), len(np.unique(groups_test))
             )
+            
+        # 3. Optional Initial Feature Pre-Filter (Based ONLY on X_train)
+        if self.initial_features is not None and self.initial_features < X_train.shape[1]:
+            logger.info(f"Applying initial pre-filter to keep {self.initial_features} closest contacts...")
+            mean_distances = X_train.mean(axis=0)
+            closest_cols = mean_distances.nsmallest(self.initial_features).index
+            X_train = X_train[closest_cols]
+            X_test = X_test[closest_cols]
+            logger.info(f"Reduced features from {X.shape[1]} to {X_train.shape[1]}")
         
-        # 3. Standardization (fit ONLY on train to avoid data leakage)
+        # 4. Standardization (fit ONLY on train to avoid data leakage)
         logger.info("Scaling features...")
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
         
         # Convert back to DataFrame if input was DataFrame (to keep feature names)
         if isinstance(X, pd.DataFrame):
-            X_train = pd.DataFrame(X_train_scaled, index=X_train.index, columns=X.columns)
-            X_test = pd.DataFrame(X_test_scaled, index=X_test.index, columns=X.columns)
+            X_train = pd.DataFrame(X_train_scaled, index=X_train.index, columns=X_train.columns)
+            X_test = pd.DataFrame(X_test_scaled, index=X_test.index, columns=X_test.columns)
         else:
             X_train = X_train_scaled
             X_test = X_test_scaled
             
         logger.info(f"Preprocessing complete. Train size: {X_train.shape[0]}, Test size: {X_test.shape[0]}")
         
-        return X_train, X_test, y_train, y_test
+        return X_train, X_test, y_train, y_test, groups_train, groups_test
 
 
 # CORRELATION ANALYZING
@@ -207,17 +241,24 @@ class CorrelationAnalyzer:
     
     def __init__(self, threshold=0.90):
         self.threshold = threshold
+        self.corr_matrix = None
+        self.mean_corrs = None
         
-    def get_features_to_drop_batch(self, X_train, batch_size=50):
+    def fit(self, X_train):
+        logger.info(f"Computing full correlation matrix for {X_train.shape[1]} features once...")
+        self.corr_matrix = X_train.corr().abs()
+        self.mean_corrs = self.corr_matrix.mean()
+        
+    def get_features_to_drop_batch(self, active_features, batch_size=50):
         """
-        Finds a batch of features to drop that are highly correlated.
+        Finds a batch of features to drop that are highly correlated among the ACTIVE features.
         """
-        if not isinstance(X_train, pd.DataFrame):
-            raise ValueError("X_train must be a pandas DataFrame.")
+        if self.corr_matrix is None:
+            raise ValueError("Must call fit() before getting features to drop.")
             
-        logger.info(f"Computing correlation matrix for {X_train.shape[1]} features...")
-        corr_matrix = X_train.corr().abs()
-        upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        # Subset the precomputed matrix to only active features
+        current_corr = self.corr_matrix.loc[active_features, active_features]
+        upper_tri = current_corr.where(np.triu(np.ones(current_corr.shape), k=1).astype(bool))
         
         high_corr_mask = upper_tri >= self.threshold
         if not high_corr_mask.any().any():
@@ -228,7 +269,6 @@ class CorrelationAnalyzer:
         sorted_indices = np.argsort(corrs)[::-1]
         
         features_to_drop = set()
-        mean_corrs = corr_matrix.mean()
         
         max_corr_found = corrs[sorted_indices[0]]
         
@@ -238,7 +278,8 @@ class CorrelationAnalyzer:
             feat_B = upper_tri.columns[c]
             
             if feat_A not in features_to_drop and feat_B not in features_to_drop:
-                if mean_corrs[feat_A] > mean_corrs[feat_B]:
+                # Use the global mean correlation to break ties
+                if self.mean_corrs[feat_A] > self.mean_corrs[feat_B]:
                     features_to_drop.add(feat_A)
                 else:
                     features_to_drop.add(feat_B)
@@ -259,27 +300,65 @@ class ModelTrainer:
     def __init__(self, random_state=42):
         self.random_state = random_state
         
-        # Initialize models as per Paper 3
+        rf_kwargs = {'random_state': random_state, 'n_estimators': 300, 'max_depth': None, 'max_features': 'sqrt'}
+        if HAS_CUML:
+            logger.info("Initializing GPU-accelerated RandomForestClassifier (cuML)")
+            # cuML specific params or defaults
+        else:
+            logger.info("Initializing CPU-based RandomForestClassifier (sklearn)")
+            rf_kwargs['n_jobs'] = -1
+
         self.models = {
             'lr': LogisticRegression(
                 random_state=random_state, 
                 max_iter=1000, 
                 solver='lbfgs',
-                n_jobs=-1
+                n_jobs=-1,
+                C=1.0 # Will be tuned
             ),
-            'rf': RandomForestClassifier(
-                random_state=random_state, 
-                n_estimators=100, 
-                max_depth=None,
-                n_jobs=-1
-            ),
+            'rf': GPU_RF(**rf_kwargs),
             'mlp': MLPClassifier(
                 random_state=random_state,
                 hidden_layer_sizes=(128, 64),
                 max_iter=500,
-                early_stopping=False
+                learning_rate_init=0.001,
+                early_stopping=True
             )
         }
+        
+    def tune_hyperparameters(self, X_train, y_train, groups=None, cv_folds=3):
+        """Perform a small hyperparameter search for RF and LR using training data only."""
+        logger.info("Starting hyperparameter tuning on training data...")
+        
+        cv = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=self.random_state) if cv_folds > 1 else 3
+        
+        # Tune RF
+        rf_param_grid = {
+            'n_estimators': [200, 300, 500],
+            'max_depth': [None, 30, 60],
+            'max_features': ['sqrt', 0.5]
+        }
+        logger.info("Tuning Random Forest...")
+        rf_search = RandomizedSearchCV(
+            self.models['rf'], rf_param_grid, n_iter=5, cv=cv, 
+            scoring='accuracy', random_state=self.random_state, 
+            n_jobs=1 if HAS_CUML else -1
+        )
+        # cuML RF may not support groups in fit, but RandomizedSearchCV handles it by passing groups to cv.split()
+        rf_search.fit(X_train, y_train, groups=groups)
+        logger.info(f"Best RF params: {rf_search.best_params_} (Val Acc: {rf_search.best_score_:.4f})")
+        self.models['rf'] = rf_search.best_estimator_
+        
+        # Tune LR
+        lr_param_grid = {'C': [0.1, 1.0, 10.0]}
+        logger.info("Tuning Logistic Regression...")
+        lr_search = RandomizedSearchCV(
+            self.models['lr'], lr_param_grid, n_iter=3, cv=cv, 
+            scoring='accuracy', random_state=self.random_state, n_jobs=-1
+        )
+        lr_search.fit(X_train, y_train, groups=groups)
+        logger.info(f"Best LR params: {lr_search.best_params_} (Val Acc: {lr_search.best_score_:.4f})")
+        self.models['lr'] = lr_search.best_estimator_
         
     def train_and_evaluate(self, X_train, X_test, y_train, y_test, models_to_run=None):
         """
@@ -307,8 +386,10 @@ class ModelTrainer:
             
             # Evaluate
             acc = accuracy_score(y_test, y_pred)
+            bal_acc = balanced_accuracy_score(y_test, y_pred)
             f1 = f1_score(y_test, y_pred)
             recall = recall_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, zero_division=0)
             
             if y_prob is not None:
                 try:
@@ -320,12 +401,14 @@ class ModelTrainer:
                 
             metrics[name] = {
                 'accuracy': acc,
+                'balanced_accuracy': bal_acc,
+                'precision': precision,
                 'f1_score': f1,
                 'roc_auc': roc_auc,
                 'recall': recall
             }
             
-            logger.debug(f"[{name.upper()}] Acc: {acc:.4f} | F1: {f1:.4f} | AUC: {roc_auc:.4f} | Recall: {recall:.4f}")
+            logger.debug(f"[{name.upper()}] Acc: {acc:.4f} | BalAcc: {bal_acc:.4f} | F1: {f1:.4f} | AUC: {roc_auc:.4f}")
             
         return metrics
 
@@ -344,57 +427,75 @@ class FeatureEliminationLoop:
         self.min_features = min_features
         self.log = []
         
-    def run(self, X_train, X_test, y_train, y_test, model_to_track='rf'):
+    def run(self, X_train, y_train, groups_train, X_test, y_test, model_to_track='rf', cv_folds=3):
         """
-        Runs the iterative elimination loop.
+        Runs the iterative elimination loop using an internal validation split.
         Returns the final feature subset and the elimination log.
         """
         logger.info("Starting Iterative Feature Elimination Loop")
         
-        current_X_train = X_train.copy()
-        current_X_test = X_test.copy()
+        # Create an internal validation set from the training data to prevent test leakage
+        if cv_folds > 1:
+            val_splitter = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+            splits = list(val_splitter.split(X_train, y_train, groups_train))
+            train_idx, val_idx = splits[0]
+            
+            X_train_inner = X_train.iloc[train_idx]
+            y_train_inner = y_train[train_idx]
+            X_val_inner = X_train.iloc[val_idx]
+            y_val_inner = y_train[val_idx]
+        else:
+            from sklearn.model_selection import train_test_split
+            X_train_inner, X_val_inner, y_train_inner, y_val_inner = train_test_split(
+                X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
+            )
         
-        # Iteration 0: Baseline (Train ALL models)
-        logger.info(f"--- ITERATION 0 (Baseline) | {current_X_train.shape[1]} features ---")
-        metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
+        active_features = X_train.columns.tolist()
+        
+        # Precompute the correlation matrix once on the FULL training set
+        self.analyzer.fit(X_train)
+        
+        # Iteration 0: Baseline (Train tracking model on inner train, eval on inner val)
+        logger.info(f"--- ITERATION 0 (Baseline) | {len(active_features)} features ---")
+        metrics = self.trainer.train_and_evaluate(X_train_inner, X_val_inner, y_train_inner, y_val_inner, models_to_run=[model_to_track])
         
         baseline_acc = metrics[model_to_track]['accuracy']
-        self._record_log(0, "None (Baseline)", current_X_train.shape[1], float('nan'), metrics)
+        self._record_log(0, "None (Baseline)", len(active_features), float('nan'), metrics)
         
         iteration = 1
-        total_to_drop = current_X_train.shape[1] - self.min_features
+        total_to_drop = len(active_features) - self.min_features
         pbar = tqdm(total=total_to_drop, desc="Eliminating Features", unit="feat")
         
         batch_size = 50 # Drop up to 50 features at a time to vastly speed up execution
         
-        while current_X_train.shape[1] > self.min_features:
-            logger.debug(f"--- ITERATION {iteration} | {current_X_train.shape[1]} features ---")
+        while len(active_features) > self.min_features:
+            logger.debug(f"--- ITERATION {iteration} | {len(active_features)} features ---")
             
-            # 1. Find batch of correlated features to drop
-            features_to_drop, max_corr = self.analyzer.get_features_to_drop_batch(current_X_train, batch_size=batch_size)
+            # 1. Find batch of correlated features to drop using precomputed matrix
+            features_to_drop, max_corr = self.analyzer.get_features_to_drop_batch(active_features, batch_size=batch_size)
             
             if not features_to_drop:
                 logger.info("STOPPING: No highly correlated features remain.")
                 break
                 
-            # 2. Drop them
-            current_X_train = current_X_train.drop(columns=features_to_drop)
-            current_X_test = current_X_test.drop(columns=features_to_drop)
+            # 2. Update active features
+            active_features = [f for f in active_features if f not in features_to_drop]
             
-            # 3. Retrain ONLY the tracking model for speed
-            metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test, models_to_run=[model_to_track])
+            # 3. Retrain ONLY the tracking model on validation set
+            metrics = self.trainer.train_and_evaluate(X_train_inner[active_features], X_val_inner[active_features], y_train_inner, y_val_inner, models_to_run=[model_to_track])
             current_acc = metrics[model_to_track]['accuracy']
             
-            # 4. Log (just record the first dropped feature name to save space)
-            self._record_log(iteration, features_to_drop[0] + f" (+{len(features_to_drop)-1} more)", current_X_train.shape[1], max_corr, metrics)
+            # 4. Log
+            self._record_log(iteration, features_to_drop[0] + f" (+{len(features_to_drop)-1} more)", len(active_features), max_corr, metrics)
             
             pbar.set_postfix({'acc': f"{current_acc:.2f}", 'corr': f"{max_corr:.2f}"})
             pbar.update(len(features_to_drop))
             
             if (baseline_acc - current_acc) > self.accuracy_tolerance:
                 logger.warning(f"STOPPING: Accuracy dropped by more than tolerance. Reverting last batch.")
-                current_X_train[features_to_drop] = X_train[features_to_drop]
-                current_X_test[features_to_drop] = X_test[features_to_drop]
+                # Restore active features while preserving original column order
+                reverted_set = set(active_features + features_to_drop)
+                active_features = [f for f in X_train.columns if f in reverted_set]
                 self.log.pop()
                 break
                 
@@ -402,15 +503,15 @@ class FeatureEliminationLoop:
             
         pbar.close()
         
-        logger.info(f"Elimination complete. Final feature count: {current_X_train.shape[1]}")
+        logger.info(f"Elimination complete. Final feature count: {len(active_features)}")
         
-        # Train ALL models one final time on the optimized feature set
-        logger.info(f"--- FINAL EVALUATION | {current_X_train.shape[1]} features ---")
-        final_metrics = self.trainer.train_and_evaluate(current_X_train, current_X_test, y_train, y_test)
-        self._record_log(iteration, "FINAL", current_X_train.shape[1], float('nan'), final_metrics)
+        # Train ALL models one final time on the FULL optimized feature set training data, evaluated on untouched Test set
+        logger.info(f"--- FINAL EVALUATION (ON TEST SET) | {len(active_features)} features ---")
+        final_metrics = self.trainer.train_and_evaluate(X_train[active_features], X_test[active_features], y_train, y_test)
+        self._record_log(iteration, "FINAL_TEST_EVAL", len(active_features), float('nan'), final_metrics)
         
         log_df = pd.DataFrame(self.log)
-        return current_X_train.columns.tolist(), log_df
+        return active_features, log_df
         
     def _record_log(self, iteration, dropped_feature, num_features, corr_val, metrics):
         entry = {

@@ -130,7 +130,7 @@ def main():
     parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files")
     parser.add_argument("--steps", type=int, default=50000, help="Number of MD steps to run")
     parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
-                        default='CPU', help="Compute platform to use")
+                        default='CUDA', help="Compute platform to use")
     parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed; use a different seed for every independent replica.")

@@ -1,6 +1,8 @@
 name: md-contactml
 channels:
+  - rapidsai
   - conda-forge
+  - nvidia
   - defaults
 dependencies:
   - python=3.11
@@ -13,4 +15,6 @@ dependencies:
   - tqdm
   - openmm
   - pdbfixer
-  - cuda-version=12.0
+  - sel(linux):
+    - cuml=24.08
+    - cuda-version=12.0
