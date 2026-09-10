@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import shutil
+import subprocess
 import numpy as np
 
 try:
@@ -126,29 +127,36 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
 def main():
     parser = argparse.ArgumentParser(description="Run MD Simulation with OpenMM")
     parser.add_argument("--input_pdb", type=str, default=DEFAULT_INPUT_PDB, help="Input PDB file")
-    parser.add_argument("--out_dir", type=str, default="data/current_sim", help="Output directory")
+    parser.add_argument("--out_dir", type=str, default="data", help="Base output directory")
     parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files")
-    parser.add_argument("--steps", type=int, default=50000, help="Number of MD steps to run")
+    parser.add_argument("--steps", type=int, default=500000, help="Number of MD steps to run")
     parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
                         default='CUDA', help="Compute platform to use")
     parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed; use a different seed for every independent replica.")
-    parser.add_argument("--report_interval", type=int, default=50000,
+    parser.add_argument("--report_interval", type=int, default=1000,
                         help="Save one DCD frame every N steps (50,000 = 100 ps at 2 fs timestep).")
-    parser.add_argument("--temperature", type=int, default=300, help="Simulation temperature in Kelvin")
     
     args = parser.parse_args()
     
-    if os.path.exists(args.out_dir):
-        logger.info(f"Removing older data in {args.out_dir}...")
-        shutil.rmtree(args.out_dir)
-    os.makedirs(args.out_dir, exist_ok=True)
-    prep_pdb = os.path.join(args.out_dir, f"{args.prefix}_prepared.pdb")
+    temperatures = [300, 400]
+    base_out_dir = args.out_dir
     
-    topology, positions = prepare_system(args.input_pdb, prep_pdb)
-    run_simulation(topology, positions, args.out_dir, args.prefix, args.steps, args.platform,
-                   args.max_min_iters, args.seed, args.report_interval, args.temperature)
+    for temp in temperatures:
+        temp_dir = os.path.join(base_out_dir, f"temp_{temp}K")
+        if os.path.exists(temp_dir):
+            logger.info(f"Removing older data in {temp_dir}...")
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        prep_pdb = os.path.join(temp_dir, f"{args.prefix}_{temp}K_prepared.pdb")
+        
+        topology, positions = prepare_system(args.input_pdb, prep_pdb)
+        run_simulation(topology, positions, temp_dir, f"{args.prefix}_{temp}K", args.steps, args.platform,
+                       args.max_min_iters, args.seed, args.report_interval, temp)
+
+    logger.info("Temperature sweep simulations complete! You can now pass these trajectories to the ML pipeline.")
 
 if __name__ == "__main__":
     main()
