@@ -8,10 +8,12 @@ dependencies:
   - python=3.11
   - numpy
   - pandas
+  - scipy
   - scikit-learn
   - matplotlib
   - seaborn
   - mdanalysis
+  - networkx
   - tqdm
   - openmm
   - pdbfixer

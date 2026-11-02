@@ -18,6 +18,11 @@ htmlcov/
 # data/trajectories/*.tar.xz
 data/trajectories/
 
+# Trajectories and simulation logs
+*.dcd
+*.log
+data/replica_*/
+
 # Output directories
 data/current_sim/
 results/

@@ -3,7 +3,6 @@ import logging
 import os
 import sys
 import shutil
-import subprocess
 import numpy as np
 
 try:
@@ -43,10 +42,7 @@ def prepare_system(input_pdb, output_pdb):
     
     logger.info("Adding missing hydrogens...")
     fixer.addMissingHydrogens(7.0)
-    
-    logger.info("Skipping explicit solvation! Using Implicit Solvent to prevent Segfaults/OOM...")
-    # fixer.addSolvent is removed.
-    
+
     logger.info("Centering molecule at (0,0,0)...")
     positions = np.array(fixer.positions.value_in_unit(unit.nanometers))
     center = np.mean(positions, axis=0)
@@ -62,15 +58,8 @@ def prepare_system(input_pdb, output_pdb):
 def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_name=None,
                    max_min_iters=0, seed=None, report_interval=50000, temperature=300):
     logger.info("Setting up simulation parameters...")
-    
-    # Use amber14 forcefield with Implicit Solvent (GBn2)
     forcefield = app.ForceField('amber14-all.xml', 'implicit/gbn2.xml')
-    
-    # No PME or Cutoff for Implicit Solvent
-    system = forcefield.createSystem(topology, nonbondedMethod=app.NoCutoff, 
-                                     constraints=app.HBonds)
-                                     
-    # Langevin integrator with 1fs timestep for stability
+    system = forcefield.createSystem(topology, nonbondedMethod=app.NoCutoff, constraints=app.HBonds)
     integrator = mm.LangevinMiddleIntegrator(temperature * unit.kelvin, 1.0/unit.picosecond, 0.001*unit.picoseconds)
     
     platform = None
@@ -84,7 +73,7 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     simulation = app.Simulation(topology, system, integrator, platform)
     simulation.context.setPositions(positions)
     
-    logger.info(f"Minimizing energy ...")
+    logger.info("Minimizing energy...")
     simulation.minimizeEnergy(tolerance=1.0 * unit.kilojoules_per_mole / unit.nanometer, maxIterations=max_min_iters)
 
     if seed is None:
@@ -93,28 +82,22 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
         simulation.context.setVelocitiesToTemperature(10 * unit.kelvin, seed)
         
     logger.info("Warming up the system gently...")
-    integrator.setStepSize(0.0001 * unit.picoseconds) # Extremely small timestep (0.1 fs)
+    integrator.setStepSize(0.0001 * unit.picoseconds)
     simulation.step(1000)
     
-    # Heat up to target temperature
     integrator.setTemperature(temperature * unit.kelvin)
     simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin)
-    integrator.setStepSize(0.001 * unit.picoseconds) # Normal stable timestep (1 fs)
+    integrator.setStepSize(0.001 * unit.picoseconds)
     
-    # Setup reporters
     os.makedirs(out_dir, exist_ok=True)
     dcd_path = os.path.join(out_dir, f"{prefix}_traj.dcd")
     log_path = os.path.join(out_dir, f"{prefix}_sim.log")
     
-    # Save trajectory to DCD
     simulation.reporters.append(app.DCDReporter(dcd_path, max(1, report_interval)))
-    
-    # Save detailed stats to log file
     simulation.reporters.append(app.StateDataReporter(log_path, max(1, report_interval), step=True, 
                                                       potentialEnergy=True, temperature=True))
                                                       
-    # Print beautiful progress to the terminal (stdout)
-    print_interval = max(1, steps // 100) # Print progress 100 times during the run
+    print_interval = max(1, steps // 100)
     simulation.reporters.append(app.StateDataReporter(sys.stdout, print_interval, step=True, 
                                                       potentialEnergy=True, temperature=True, 
                                                       progress=True, remainingTime=True, 
@@ -124,39 +107,122 @@ def run_simulation(topology, positions, out_dir, prefix, steps=10000, platform_n
     simulation.step(steps)
     logger.info(f"Simulation complete. Trajectory saved to {dcd_path}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Run MD Simulation with OpenMM")
-    parser.add_argument("--input_pdb", type=str, default=DEFAULT_INPUT_PDB, help="Input PDB file")
-    parser.add_argument("--out_dir", type=str, default="data", help="Base output directory")
-    parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files")
-    parser.add_argument("--steps", type=int, default=500000, help="Number of MD steps to run")
-    parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
-                        default='CUDA', help="Compute platform to use")
-    parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed; use a different seed for every independent replica.")
-    parser.add_argument("--report_interval", type=int, default=1000,
-                        help="Save one DCD frame every N steps (50,000 = 100 ps at 2 fs timestep).")
-    
-    args = parser.parse_args()
-    
-    temperatures = [300, 400]
-    base_out_dir = args.out_dir
-    
+
+def run_temperature_series(input_pdb, replica_dir, prefix, args, seed=None):
+    temperatures = getattr(args, 'temperatures', [300, 400])
     for temp in temperatures:
-        temp_dir = os.path.join(base_out_dir, f"temp_{temp}K")
+        temp_dir = os.path.join(replica_dir, f"temp_{temp}K")
+        dcd_path = os.path.join(temp_dir, f"{prefix}_{temp}K_traj.dcd")
+
+        if os.path.exists(dcd_path) and getattr(args, 'skip_existing', False):
+            logger.info(f"Trajectory already exists at {dcd_path}. Skipping due to --skip_existing.")
+            continue
+
         if os.path.exists(temp_dir):
             logger.info(f"Removing older data in {temp_dir}...")
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
-        
-        prep_pdb = os.path.join(temp_dir, f"{args.prefix}_{temp}K_prepared.pdb")
-        
-        topology, positions = prepare_system(args.input_pdb, prep_pdb)
-        run_simulation(topology, positions, temp_dir, f"{args.prefix}_{temp}K", args.steps, args.platform,
-                       args.max_min_iters, args.seed, args.report_interval, temp)
 
-    logger.info("Temperature sweep simulations complete! You can now pass these trajectories to the ML pipeline.")
+        prep_pdb = os.path.join(temp_dir, f"{prefix}_{temp}K_prepared.pdb")
+        topology, positions = prepare_system(input_pdb, prep_pdb)
+        run_simulation(
+            topology,
+            positions,
+            temp_dir,
+            f"{prefix}_{temp}K",
+            args.steps,
+            args.platform,
+            args.max_min_iters,
+            seed,
+            args.report_interval,
+            temp,
+        )
+
+
+def get_replica_dir(base_out_dir, rep_id):
+    norm_path = os.path.normpath(base_out_dir)
+    basename = os.path.basename(norm_path)
+    if basename == f"replica_{rep_id}":
+        return norm_path
+    return os.path.join(base_out_dir, f"replica_{rep_id}")
+
+
+def run_replicas(input_pdb, base_out_dir, prefix, args):
+    if args.replica_id is not None:
+        replicas_to_run = [args.replica_id]
+    else:
+        norm_path = os.path.normpath(base_out_dir)
+        basename = os.path.basename(norm_path)
+        if basename.startswith("replica_"):
+            try:
+                rep_num = int(basename.split("_")[1])
+                replicas_to_run = [rep_num]
+            except ValueError:
+                replicas_to_run = list(range(1, args.num_replicas + 1))
+        else:
+            replicas_to_run = list(range(1, args.num_replicas + 1))
+
+    for rep_id in replicas_to_run:
+        replica_dir = get_replica_dir(base_out_dir, rep_id)
+        logger.info(f"============================================================")
+        logger.info(f"STARTING SIMULATION FOR REPLICA {rep_id} IN: {replica_dir}")
+        logger.info(f"============================================================")
+        rep_seed = (args.seed + (rep_id - 1) * 1000) if args.seed is not None else (1000 * rep_id + 42)
+        run_temperature_series(input_pdb, replica_dir, prefix, args, seed=rep_seed)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run MD Simulation with OpenMM across Replicas and Temperatures")
+    parser.add_argument("--input_pdb", type=str, default=DEFAULT_INPUT_PDB, help="Input PDB file (default: 1A22.pdb)")
+    parser.add_argument("--out_dir", type=str, default="data", help="Base output directory (default: data)")
+    parser.add_argument("--num_replicas", type=int, default=3, help="Number of independent replicas to simulate (default: 3)")
+    parser.add_argument("--replica_id", type=int, default=None,
+                        help="Run only a specific replica ID (e.g. 1, 2, or 3). Default: None (runs all num_replicas).")
+    parser.add_argument("--temperatures", nargs="+", type=int, default=[300, 400],
+                        help="Temperatures in Kelvin to simulate (default: 300 400)")
+    parser.add_argument("--wild_type_pdb", type=str, default=None,
+                        help="Optional wild-type PDB for additional m_w data")
+    parser.add_argument("--mutant_pdb", type=str, default=None,
+                        help="Optional mutant PDB for additional m_w data")
+    parser.add_argument("--mw_out_dir", type=str, default="data/m_w",
+                        help="Output directory for wild-type and mutant data")
+    parser.add_argument("--prefix", type=str, default="sim", help="Prefix for output files (default: sim)")
+    parser.add_argument("--steps", type=int, default=200000,
+                        help="Number of MD steps to run (default: 200000; 200 ps at 1 fs, yielding 200 frames)")
+    parser.add_argument("--platform", type=str, choices=['Reference', 'CPU', 'CUDA', 'OpenCL'], 
+                        default='CUDA', help="Compute platform to use (default: CUDA)")
+    parser.add_argument("--max_min_iters", type=int, default=0, help="Max iterations for energy minimization (0 for unlimited)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base random seed for velocity initialization (automatically offset per replica).")
+    parser.add_argument("--report_interval", type=int, default=1000,
+                        help="Save one DCD frame every N steps (default: 1000).")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="Skip simulation if trajectory file (.dcd) already exists in target directory.")
+    
+    args = parser.parse_args()
+
+    if (args.wild_type_pdb is None) != (args.mutant_pdb is None):
+        parser.error("--wild_type_pdb and --mutant_pdb must be provided together.")
+    if args.wild_type_pdb and not os.path.isfile(args.wild_type_pdb):
+        parser.error(f"Wild-type PDB not found: {args.wild_type_pdb}")
+    if args.mutant_pdb and not os.path.isfile(args.mutant_pdb):
+        parser.error(f"Mutant PDB not found: {args.mutant_pdb}")
+
+    run_replicas(args.input_pdb, args.out_dir, args.prefix, args)
+
+    if args.wild_type_pdb and args.mutant_pdb:
+        run_replicas(
+            args.wild_type_pdb,
+            os.path.join(args.mw_out_dir, "wild_type"),
+            f"{args.prefix}_wt",
+            args,
+        )
+        run_replicas(
+            args.mutant_pdb,
+            os.path.join(args.mw_out_dir, "mutant"),
+            f"{args.prefix}_mutant",
+            args,
+        )
 
 if __name__ == "__main__":
     main()

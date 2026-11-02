@@ -9,7 +9,7 @@ import os
 import sys
 import argparse
 
-DEFAULT_PDB_FILE = "/Users/nirav/Docs/MD-ContactML/1AKI.pdb" 
+DEFAULT_PDB_FILE = "/Users/nirav/Docs/MD-ContactML/1A22.pdb" 
 
 def main():
     parser = argparse.ArgumentParser(description="Render a PDB structure using PyMOL")
