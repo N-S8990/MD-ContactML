@@ -156,18 +156,15 @@ class ComprehensiveFeatureExtractor:
             ("HB_A_GLN68_B_TRP124", "chainID A and resid 68 and (name OE1 or name NE2)", "chainID B and resid 124 and (name NE1 or name O)")
         ]
 
-        # Reference C-alpha positions for interface displacement tracking
-        self.ref_ca_pos_A = {}
-        for rA in self.res_A_list:
-            ca_sel = u.select_atoms(f"chainID A and resid {rA.resid} and name CA")
-            if len(ca_sel) > 0:
-                self.ref_ca_pos_A[rA.resid] = ca_sel.positions[0].copy()
-
-        self.ref_ca_pos_B = {}
-        for rB in self.res_B_list:
-            ca_sel = u.select_atoms(f"chainID B and resid {rB.resid} and name CA")
-            if len(ca_sel) > 0:
-                self.ref_ca_pos_B[rB.resid] = ca_sel.positions[0].copy()
+        # Reference C-alpha positions for all residues in Chain A and Chain B
+        self.ref_ca_pos_A = {
+            int(atom.resid): atom.position.copy()
+            for atom in u.select_atoms("chainID A and name CA")
+        }
+        self.ref_ca_pos_B = {
+            int(atom.resid): atom.position.copy()
+            for atom in u.select_atoms("chainID B and name CA")
+        }
 
         # Precompute D-H covalent pairs for strict angle hydrogen bonding
         self.dh_pairs_A = self._find_dh_pairs(u, "chainID A")
@@ -363,12 +360,37 @@ class ComprehensiveFeatureExtractor:
             evals = np.sort(np.linalg.eigvalsh(inertia))
             row["GLOBAL_asphericity"] = float((evals[2] - 0.5 * (evals[0] + evals[1])) / (evals.sum() + 1e-6))
 
-            aligned_A = np.asarray([aligned_ca_by_index[int(atom.index)] for atom in chA.select_atoms("name CA")])
-            aligned_B = np.asarray([aligned_ca_by_index[int(atom.index)] for atom in chB.select_atoms("name CA")])
-            ref_A_ca = np.asarray([self.ref_ca_pos_A[int(atom.resid)] for atom in chA.select_atoms("name CA")])
-            ref_B_ca = np.asarray([self.ref_ca_pos_B[int(atom.resid)] for atom in chB.select_atoms("name CA")])
-            row["DYN_RMSD_ChainA"] = float(np.sqrt(np.mean(np.sum((aligned_A - ref_A_ca) ** 2, axis=1))))
-            row["DYN_RMSD_ChainB"] = float(np.sqrt(np.mean(np.sum((aligned_B - ref_B_ca) ** 2, axis=1))))
+            ca_atoms_A = chA.select_atoms("name CA")
+            aligned_A = []
+            ref_A_ca = []
+            for atom in ca_atoms_A:
+                r_id = int(atom.resid)
+                a_idx = int(atom.index)
+                if r_id in self.ref_ca_pos_A and a_idx in aligned_ca_by_index:
+                    aligned_A.append(aligned_ca_by_index[a_idx])
+                    ref_A_ca.append(self.ref_ca_pos_A[r_id])
+            if len(aligned_A) > 0:
+                aligned_A = np.asarray(aligned_A)
+                ref_A_ca = np.asarray(ref_A_ca)
+                row["DYN_RMSD_ChainA"] = float(np.sqrt(np.mean(np.sum((aligned_A - ref_A_ca) ** 2, axis=1))))
+            else:
+                row["DYN_RMSD_ChainA"] = 0.0
+
+            ca_atoms_B = chB.select_atoms("name CA")
+            aligned_B = []
+            ref_B_ca = []
+            for atom in ca_atoms_B:
+                r_id = int(atom.resid)
+                a_idx = int(atom.index)
+                if r_id in self.ref_ca_pos_B and a_idx in aligned_ca_by_index:
+                    aligned_B.append(aligned_ca_by_index[a_idx])
+                    ref_B_ca.append(self.ref_ca_pos_B[r_id])
+            if len(aligned_B) > 0:
+                aligned_B = np.asarray(aligned_B)
+                ref_B_ca = np.asarray(ref_B_ca)
+                row["DYN_RMSD_ChainB"] = float(np.sqrt(np.mean(np.sum((aligned_B - ref_B_ca) ** 2, axis=1))))
+            else:
+                row["DYN_RMSD_ChainB"] = 0.0
 
             if len(dip_pos_A) and len(dip_neg_A) and len(dip_pos_B) and len(dip_neg_B):
                 pA = dip_pos_A.center_of_mass()
@@ -658,27 +680,37 @@ class ComprehensiveFeatureExtractor:
             # Per-residue interface displacement, RMSF & B-factor equivalents
             disps_A = []
             for rA in self.res_A_list:
-                if rA.resid in self.ref_ca_pos_A:
-                    ca_atom = u.select_atoms(f"chainID A and resid {rA.resid} and name CA")[0]
-                    ca_cur = aligned_ca_by_index[int(ca_atom.index)]
-                    disp = float(np.linalg.norm(ca_cur - self.ref_ca_pos_A[rA.resid]))
-                    row[f"DISP_CA_A_{rA.resid}"] = disp
-                    rmsf = ca_to_rmsf[("A", int(rA.resid))]
-                    row[f"RMSF_CA_A_{rA.resid}"] = rmsf
-                    row[f"BFACTOR_RMSF_A_{rA.resid}"] = float((8.0 * np.pi**2 / 3.0) * (rmsf**2))
-                    disps_A.append(disp)
+                r_resid = int(rA.resid)
+                if r_resid in self.ref_ca_pos_A:
+                    ca_sel = u.select_atoms(f"chainID A and resid {r_resid} and name CA")
+                    if len(ca_sel) > 0:
+                        ca_atom = ca_sel[0]
+                        ca_idx = int(ca_atom.index)
+                        if ca_idx in aligned_ca_by_index:
+                            ca_cur = aligned_ca_by_index[ca_idx]
+                            disp = float(np.linalg.norm(ca_cur - self.ref_ca_pos_A[r_resid]))
+                            row[f"DISP_CA_A_{r_resid}"] = disp
+                            rmsf = ca_to_rmsf.get(("A", r_resid), 0.0)
+                            row[f"RMSF_CA_A_{r_resid}"] = rmsf
+                            row[f"BFACTOR_RMSF_A_{r_resid}"] = float((8.0 * np.pi**2 / 3.0) * (rmsf**2))
+                            disps_A.append(disp)
 
             disps_B = []
             for rB in self.res_B_list:
-                if rB.resid in self.ref_ca_pos_B:
-                    ca_atom = u.select_atoms(f"chainID B and resid {rB.resid} and name CA")[0]
-                    ca_cur = aligned_ca_by_index[int(ca_atom.index)]
-                    disp = float(np.linalg.norm(ca_cur - self.ref_ca_pos_B[rB.resid]))
-                    row[f"DISP_CA_B_{rB.resid}"] = disp
-                    rmsf = ca_to_rmsf[("B", int(rB.resid))]
-                    row[f"RMSF_CA_B_{rB.resid}"] = rmsf
-                    row[f"BFACTOR_RMSF_B_{rB.resid}"] = float((8.0 * np.pi**2 / 3.0) * (rmsf**2))
-                    disps_B.append(disp)
+                r_resid = int(rB.resid)
+                if r_resid in self.ref_ca_pos_B:
+                    ca_sel = u.select_atoms(f"chainID B and resid {r_resid} and name CA")
+                    if len(ca_sel) > 0:
+                        ca_atom = ca_sel[0]
+                        ca_idx = int(ca_atom.index)
+                        if ca_idx in aligned_ca_by_index:
+                            ca_cur = aligned_ca_by_index[ca_idx]
+                            disp = float(np.linalg.norm(ca_cur - self.ref_ca_pos_B[r_resid]))
+                            row[f"DISP_CA_B_{r_resid}"] = disp
+                            rmsf = ca_to_rmsf.get(("B", r_resid), 0.0)
+                            row[f"RMSF_CA_B_{r_resid}"] = rmsf
+                            row[f"BFACTOR_RMSF_B_{r_resid}"] = float((8.0 * np.pi**2 / 3.0) * (rmsf**2))
+                            disps_B.append(disp)
 
             mean_disp_A = float(np.mean(disps_A)) if disps_A else 0.0
             mean_disp_B = float(np.mean(disps_B)) if disps_B else 0.0
@@ -688,9 +720,11 @@ class ComprehensiveFeatureExtractor:
             row["DYN_interface_max_disp_B"] = float(np.max(disps_B)) if disps_B else 0.0
             row["DYN_interface_mean_bfactor_A"] = float((8.0 * np.pi**2 / 3.0) * (mean_disp_A**2))
             row["DYN_interface_mean_bfactor_B"] = float((8.0 * np.pi**2 / 3.0) * (mean_disp_B**2))
-            row["DYN_interface_mean_rmsf_A"] = float(np.mean([ca_to_rmsf[("A", int(r.resid))] for r in self.res_A_list]))
-            row["DYN_interface_mean_rmsf_B"] = float(np.mean([ca_to_rmsf[("B", int(r.resid))] for r in self.res_B_list]))
-            row["DYN_interface_mean_bfactor_rmsf_A"] = float((8.0 * np.pi**2 / 3.0) * row["DYN_interface_mean_rmsf_A"]**2)
+            rmsf_list_A = [ca_to_rmsf[("A", int(r.resid))] for r in self.res_A_list if ("A", int(r.resid)) in ca_to_rmsf]
+            rmsf_list_B = [ca_to_rmsf[("B", int(r.resid))] for r in self.res_B_list if ("B", int(r.resid)) in ca_to_rmsf]
+            row["DYN_interface_mean_rmsf_A"] = float(np.mean(rmsf_list_A)) if rmsf_list_A else 0.0
+            row["DYN_interface_mean_rmsf_B"] = float(np.mean(rmsf_list_B)) if rmsf_list_B else 0.0
+            row["DYN_interface_mean_bfactor_rmsf_A"] = float((8.0 * np.pi**2 / 3.0) * (row["DYN_interface_mean_rmsf_A"]**2))
             row["DYN_interface_mean_bfactor_rmsf_B"] = float((8.0 * np.pi**2 / 3.0) * row["DYN_interface_mean_rmsf_B"]**2)
 
             for chain_tag, resid, phi, psi, omega, chi1 in torsion_groups:
@@ -1103,7 +1137,7 @@ def categorize_feature(feat):
         return "Solvent Accessible & Buried Surface Area"
     elif feat.startswith("INTERFACE_"):
         return "Interface Geometry & Planarity"
-    elif feat.startswith("BFACTOR_"):
+    elif feat.startswith("BFACTOR_") or feat.startswith("RMSF_"):
         return "Dynamic Fluctuation & B-Factor Equivalent"
     elif feat.startswith("DISP_"):
         return "Interface Residue Displacement"
@@ -1250,7 +1284,7 @@ def map_feature_to_cluster(feat):
         return "CLUSTER_GLOBAL_SHAPE"
     if feat.startswith("DYN_"):
         return "CLUSTER_GLOBAL_DYNAMICS"
-    if feat.startswith("DISP_") or feat.startswith("BFACTOR_"):
+    if feat.startswith("DISP_") or feat.startswith("BFACTOR_") or feat.startswith("RMSF_"):
         return "CLUSTER_INTERFACE_DISPLACEMENT"
     if feat.startswith("SASA_") or feat.startswith("BURIED_"):
         return "CLUSTER_SASA_BURIED_AREA"
