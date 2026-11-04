@@ -1,6 +1,7 @@
-import time
+import hashlib
 import re
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -18,14 +19,52 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.base import clone
+from sklearn.model_selection import GroupKFold
 from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, precision_score,
-    recall_score, f1_score, roc_auc_score, log_loss
+    recall_score, f1_score, roc_auc_score, average_precision_score,
+    brier_score_loss, log_loss
 )
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MD-ContactML")
+
+FEATURE_CACHE_VERSION = "3"
+VDW_RADII = {'C': 1.70, 'N': 1.55, 'O': 1.52, 'S': 1.80, 'H': 1.20, 'P': 1.80}
+
+def get_vdw_radii(atoms):
+    return np.array([VDW_RADII.get(a.name[0], 1.70) for a in atoms])
+
+def generate_fibonacci_sphere(n_points=32):
+    indices = np.arange(0, n_points, dtype=float) + 0.5
+    phi = np.arccos(1.0 - 2.0 * indices / n_points)
+    theta = np.pi * (1.0 + 5.0**0.5) * indices
+    return np.column_stack((np.cos(theta)*np.sin(phi), np.sin(theta)*np.sin(phi), np.cos(phi)))
+
+def compute_fast_sasa(target_atoms, env_atoms, sphere_pts, r_probe=1.4):
+    target_pos = target_atoms.positions
+    target_r = get_vdw_radii(target_atoms) + r_probe
+    env_pos = env_atoms.positions
+    env_r = get_vdw_radii(env_atoms) + r_probe
+    n_target = len(target_atoms)
+    const = 4.0 * np.pi / len(sphere_pts)
+    d_mat = distances.distance_array(target_pos, env_pos)
+    sasa = np.zeros(n_target)
+    for i in range(n_target):
+        ri = target_r[i]
+        nbr_mask = (d_mat[i] < (ri + 3.2)) & (d_mat[i] > 1e-4)
+        if not np.any(nbr_mask):
+            sasa[i] = 4.0 * np.pi * (ri**2)
+            continue
+        nbr_pos = env_pos[nbr_mask] - target_pos[i]
+        nbr_r_sq = env_r[nbr_mask]**2
+        pts_i = ri * sphere_pts
+        diff = pts_i[:, None, :] - nbr_pos[None, :, :]
+        accessible = np.all(np.sum(diff**2, axis=-1) > nbr_r_sq[None, :], axis=-1)
+        sasa[i] = const * (ri**2) * np.sum(accessible)
+    return sasa
 
 
 class ComprehensiveFeatureExtractor:
@@ -38,8 +77,6 @@ class ComprehensiveFeatureExtractor:
         u = mda.Universe(self.reference_pdb)
         u.trajectory[0]
 
-        chA = u.select_atoms("chainID A")
-        chB = u.select_atoms("chainID B")
         heavy_A = u.select_atoms("chainID A and not name H*")
         heavy_B = u.select_atoms("chainID B and not name H*")
 
@@ -119,12 +156,70 @@ class ComprehensiveFeatureExtractor:
             ("HB_A_GLN68_B_TRP124", "chainID A and resid 68 and (name OE1 or name NE2)", "chainID B and resid 124 and (name NE1 or name O)")
         ]
 
-    def extract_trajectory_features(self, topology, trajectory, max_frames=None, frame_stride=1):
+        # Reference C-alpha positions for interface displacement tracking
+        self.ref_ca_pos_A = {}
+        for rA in self.res_A_list:
+            ca_sel = u.select_atoms(f"chainID A and resid {rA.resid} and name CA")
+            if len(ca_sel) > 0:
+                self.ref_ca_pos_A[rA.resid] = ca_sel.positions[0].copy()
+
+        self.ref_ca_pos_B = {}
+        for rB in self.res_B_list:
+            ca_sel = u.select_atoms(f"chainID B and resid {rB.resid} and name CA")
+            if len(ca_sel) > 0:
+                self.ref_ca_pos_B[rB.resid] = ca_sel.positions[0].copy()
+
+        # Precompute D-H covalent pairs for strict angle hydrogen bonding
+        self.dh_pairs_A = self._find_dh_pairs(u, "chainID A")
+        self.dh_pairs_B = self._find_dh_pairs(u, "chainID B")
+        self.acc_A_indices = u.select_atoms("chainID A and (name O or name OD1 or name OD2 or name OE1 or name OE2 or name ND2 or name NE2 or name OG or name OG1 or name OH or name ND1)").indices
+        self.acc_B_indices = u.select_atoms("chainID B and (name O or name OD1 or name OD2 or name OE1 or name OE2 or name ND2 or name NE2 or name OG or name OG1 or name OH or name ND1)").indices
+
+        self.sphere_pts = generate_fibonacci_sphere(32)
+
+    @staticmethod
+    def _kabsch_align(mobile, reference):
+        """Return mobile coordinates superposed on reference by least-squares fit."""
+        mobile_center = mobile.mean(axis=0)
+        reference_center = reference.mean(axis=0)
+        mobile_centered = mobile - mobile_center
+        reference_centered = reference - reference_center
+        covariance = mobile_centered.T @ reference_centered
+        u_mat, _, vh_mat = np.linalg.svd(covariance)
+        rotation = u_mat @ vh_mat
+        if np.linalg.det(rotation) < 0:
+            u_mat[:, -1] *= -1.0
+            rotation = u_mat @ vh_mat
+        return mobile_centered @ rotation + reference_center
+
+    def _find_dh_pairs(self, universe, chain_sel):
+        donors = universe.select_atoms(f"{chain_sel} and (name N or name NZ or name NH1 or name NH2 or name ND2 or name NE2 or name OG or name OG1 or name OH or name NE)")
+        hydrogens = universe.select_atoms(f"{chain_sel} and name H*")
+        if len(donors) == 0 or len(hydrogens) == 0:
+            return []
+        d_mat = distances.distance_array(donors.positions, hydrogens.positions)
+        pairs = []
+        for d_i in range(len(donors)):
+            h_idx = np.where(d_mat[d_i] < 1.2)[0]
+            for h_j in h_idx:
+                is_bb = (donors[d_i].name == "N")
+                pairs.append((donors[d_i].index, hydrogens[h_j].index, is_bb))
+        return pairs
+
+    def extract_trajectory_features(self, topology, trajectory, max_frames=None, frame_stride=1, cache_path=None):
+        if cache_path is not None:
+            cache_path = Path(cache_path)
+            if cache_path.exists():
+                logger.info(f"Loading cached features from {cache_path}")
+                return pd.read_pickle(cache_path)
+
         logger.info(f"Extracting features from {trajectory}...")
         u = mda.Universe(topology, trajectory)
 
         chA = u.select_atoms("chainID A")
         chB = u.select_atoms("chainID B")
+        heavy_A = u.select_atoms("chainID A and not name H*")
+        heavy_B = u.select_atoms("chainID B and not name H*")
         basic_A = u.select_atoms("chainID A and resname ARG LYS HIS and (name NZ or name NH1 or name NH2 or name ND1 or name NE2)")
         acidic_B = u.select_atoms("chainID B and resname ASP GLU and (name OD1 or name OD2 or name OE1 or name OE2)")
         acidic_A = u.select_atoms("chainID A and resname ASP GLU and (name OD1 or name OD2 or name OE1 or name OE2)")
@@ -218,25 +313,44 @@ class ComprehensiveFeatureExtractor:
         heavy_int_B = u.select_atoms(f"chainID B and not name H* and resid {int_res_B_str}")
 
         torsion_groups = []
-        for rA in self.res_A_list[:12]:
+        for rA in self.res_A_list:
             res = u.select_atoms(f"chainID A and resid {rA.resid}").residues[0]
-            torsion_groups.append(("A", rA.resid, res.phi_selection(), res.psi_selection(), res.chi1_selection()))
+            torsion_groups.append(("A", rA.resid, res.phi_selection(), res.psi_selection(), res.omega_selection(), res.chi1_selection()))
 
-        for rB in self.res_B_list[:12]:
+        for rB in self.res_B_list:
             res = u.select_atoms(f"chainID B and resid {rB.resid}").residues[0]
-            torsion_groups.append(("B", rB.resid, res.phi_selection(), res.psi_selection(), res.chi1_selection()))
+            torsion_groups.append(("B", rB.resid, res.phi_selection(), res.psi_selection(), res.omega_selection(), res.chi1_selection()))
 
-        ref_chA_pos = chA.positions.copy()
-        ref_chB_pos = chB.positions.copy()
+        # Dynamics must be measured after removing rigid-body translation/rotation.
+        # Use ordered interface C-alpha atoms for a stable Kabsch alignment.
+        ca_all = u.select_atoms("(chainID A or chainID B) and name CA")
+        ref_u = mda.Universe(self.reference_pdb)
+        ref_ca_all = ref_u.select_atoms("(chainID A or chainID B) and name CA")
+        if len(ca_all) != len(ref_ca_all):
+            raise ValueError("Reference and trajectory C-alpha selections do not match.")
+        ref_ca_all_pos = ref_ca_all.positions.copy()
+        ca_frame_positions = []
 
         frame_indices = list(range(0, len(u.trajectory), frame_stride))
         if max_frames is not None:
             frame_indices = frame_indices[:max_frames]
 
-        records = []
         for f_idx in frame_indices:
             u.trajectory[f_idx]
+            ca_frame_positions.append(self._kabsch_align(ca_all.positions.copy(), ref_ca_all_pos))
+        ca_frame_positions = np.asarray(ca_frame_positions)
+        ca_mean = ca_frame_positions.mean(axis=0)
+        ca_rmsf = np.sqrt(np.mean(np.sum((ca_frame_positions - ca_mean) ** 2, axis=2), axis=0))
+        ca_to_rmsf = {(str(atom.chainID), int(atom.resid)): float(value)
+                      for atom, value in zip(ca_all, ca_rmsf)}
+
+        records = []
+        for frame_number, f_idx in enumerate(frame_indices):
+            u.trajectory[f_idx]
             row = {}
+
+            aligned_ca = ca_frame_positions[frame_number]
+            aligned_ca_by_index = {int(atom.index): aligned_ca[i] for i, atom in enumerate(ca_all)}
 
             row["GLOBAL_Rg_complex"] = float(u.atoms.radius_of_gyration())
             row["GLOBAL_Rg_A"] = float(chA.radius_of_gyration())
@@ -249,8 +363,12 @@ class ComprehensiveFeatureExtractor:
             evals = np.sort(np.linalg.eigvalsh(inertia))
             row["GLOBAL_asphericity"] = float((evals[2] - 0.5 * (evals[0] + evals[1])) / (evals.sum() + 1e-6))
 
-            row["DYN_RMSD_ChainA"] = float(np.sqrt(np.mean((chA.positions - ref_chA_pos)**2)))
-            row["DYN_RMSD_ChainB"] = float(np.sqrt(np.mean((chB.positions - ref_chB_pos)**2)))
+            aligned_A = np.asarray([aligned_ca_by_index[int(atom.index)] for atom in chA.select_atoms("name CA")])
+            aligned_B = np.asarray([aligned_ca_by_index[int(atom.index)] for atom in chB.select_atoms("name CA")])
+            ref_A_ca = np.asarray([self.ref_ca_pos_A[int(atom.resid)] for atom in chA.select_atoms("name CA")])
+            ref_B_ca = np.asarray([self.ref_ca_pos_B[int(atom.resid)] for atom in chB.select_atoms("name CA")])
+            row["DYN_RMSD_ChainA"] = float(np.sqrt(np.mean(np.sum((aligned_A - ref_A_ca) ** 2, axis=1))))
+            row["DYN_RMSD_ChainB"] = float(np.sqrt(np.mean(np.sum((aligned_B - ref_B_ca) ** 2, axis=1))))
 
             if len(dip_pos_A) and len(dip_neg_A) and len(dip_pos_B) and len(dip_neg_B):
                 pA = dip_pos_A.center_of_mass()
@@ -279,6 +397,38 @@ class ComprehensiveFeatureExtractor:
                 row["PACKING_intra_chain_A_contacts_4_5A"] = float(intra_A_cnt)
                 row["PACKING_intra_chain_B_contacts_4_5A"] = float(intra_B_cnt)
                 row["PACKING_ratio_inter_to_intra"] = float(inter_cnt / (intra_A_cnt + intra_B_cnt + 1e-4))
+
+                # Buried Surface Area (Delta SASA) via Fibonacci Sphere Integration
+                sA_iso = compute_fast_sasa(heavy_int_A, heavy_A, self.sphere_pts, r_probe=1.4)
+                sB_iso = compute_fast_sasa(heavy_int_B, heavy_B, self.sphere_pts, r_probe=1.4)
+                sA_cpx = compute_fast_sasa(heavy_int_A, heavy_A + heavy_B, self.sphere_pts, r_probe=1.4)
+                sB_cpx = compute_fast_sasa(heavy_int_B, heavy_A + heavy_B, self.sphere_pts, r_probe=1.4)
+
+                buried_A = np.maximum(0.0, sA_iso - sA_cpx)
+                buried_B = np.maximum(0.0, sB_iso - sB_cpx)
+                buried_total = float(np.sum(buried_A) + np.sum(buried_B))
+
+                apolar_mask_A = np.isin([a.name[0] for a in heavy_int_A], ['C', 'S'])
+                apolar_mask_B = np.isin([a.name[0] for a in heavy_int_B], ['C', 'S'])
+                buried_apolar = float(np.sum(buried_A[apolar_mask_A]) + np.sum(buried_B[apolar_mask_B]))
+                buried_polar = float(max(0.0, buried_total - buried_apolar))
+
+                row["BURIED_SASA_total"] = buried_total
+                row["BURIED_SASA_apolar"] = buried_apolar
+                row["BURIED_SASA_polar"] = buried_polar
+                row["BURIED_SASA_apolar_fraction"] = float(buried_apolar / (buried_total + 1e-6))
+                row["SASA_interface_ChainA"] = float(np.sum(sA_cpx))
+                row["SASA_interface_ChainB"] = float(np.sum(sB_cpx))
+                row["SASA_interface_Complex"] = float(np.sum(sA_cpx) + np.sum(sB_cpx))
+
+                # Interface Planarity & Shape Geometry
+                pos_int = (heavy_int_A + heavy_int_B).positions
+                pos_c = pos_int - np.mean(pos_int, axis=0)
+                cov = (pos_c.T @ pos_c) / len(pos_int)
+                evals = np.sort(np.linalg.eigvalsh(cov))[::-1]
+                row["INTERFACE_planarity_thickness"] = float(evals[2] / (np.sum(evals) + 1e-6))
+                row["INTERFACE_eccentricity"] = float(np.sqrt(np.clip(1.0 - evals[1] / (evals[0] + 1e-6), 0.0, 1.0)))
+                row["INTERFACE_span_radius"] = float(np.max(np.linalg.norm(pos_c, axis=1)))
 
             total_sb = 0
             if len(basic_A) and len(acidic_B):
@@ -334,6 +484,89 @@ class ComprehensiveFeatureExtractor:
             row["HBOND_total_3_5A"] = float(cnt_bb_35 + cnt_sc_35 + cnt_mix_35)
             row["HBOND_total_3_0A"] = float(cnt_bb_30 + cnt_sc_30 + cnt_mix_30)
 
+            # Strict Directional Hydrogen Bonds with Angular Geometry Criteria (theta >= 120 deg)
+            strict_35_120 = 0
+            strict_30_135 = 0
+            strict_bb_bb = 0
+            strict_sc_sc = 0
+            strict_sc_bb = 0
+
+            if len(self.dh_pairs_A) and len(self.acc_B_indices):
+                d_indices = np.array([p[0] for p in self.dh_pairs_A])
+                h_indices = np.array([p[1] for p in self.dh_pairs_A])
+                is_bb_flags = np.array([p[2] for p in self.dh_pairs_A])
+                pos_D = u.atoms[d_indices].positions
+                pos_H = u.atoms[h_indices].positions
+                pos_Acc = u.atoms[self.acc_B_indices].positions
+                acc_is_bb = np.array([u.atoms[i].name == "O" for i in self.acc_B_indices])
+
+                d_da = distances.distance_array(pos_D, pos_Acc)
+                cand_d, cand_a = np.where(d_da < 3.5)
+                if len(cand_d):
+                    v_dh = pos_H[cand_d] - pos_D[cand_d]
+                    v_da = pos_Acc[cand_a] - pos_D[cand_d]
+                    norm_dh = np.linalg.norm(v_dh, axis=1)
+                    norm_da = np.linalg.norm(v_da, axis=1)
+                    cos_ang = np.sum(v_dh * v_da, axis=1) / (norm_dh * norm_da + 1e-9)
+                    angles = np.degrees(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
+
+                    for k in range(len(angles)):
+                        ang = angles[k]
+                        dist = d_da[cand_d[k], cand_a[k]]
+                        d_bb = is_bb_flags[cand_d[k]]
+                        a_bb = acc_is_bb[cand_a[k]]
+                        if ang >= 120.0:
+                            strict_35_120 += 1
+                            if d_bb and a_bb:
+                                strict_bb_bb += 1
+                            elif not d_bb and not a_bb:
+                                strict_sc_sc += 1
+                            else:
+                                strict_sc_bb += 1
+                        if ang >= 135.0 and dist < 3.0:
+                            strict_30_135 += 1
+
+            if len(self.dh_pairs_B) and len(self.acc_A_indices):
+                d_indices = np.array([p[0] for p in self.dh_pairs_B])
+                h_indices = np.array([p[1] for p in self.dh_pairs_B])
+                is_bb_flags = np.array([p[2] for p in self.dh_pairs_B])
+                pos_D = u.atoms[d_indices].positions
+                pos_H = u.atoms[h_indices].positions
+                pos_Acc = u.atoms[self.acc_A_indices].positions
+                acc_is_bb = np.array([u.atoms[i].name == "O" for i in self.acc_A_indices])
+
+                d_da = distances.distance_array(pos_D, pos_Acc)
+                cand_d, cand_a = np.where(d_da < 3.5)
+                if len(cand_d):
+                    v_dh = pos_H[cand_d] - pos_D[cand_d]
+                    v_da = pos_Acc[cand_a] - pos_D[cand_d]
+                    norm_dh = np.linalg.norm(v_dh, axis=1)
+                    norm_da = np.linalg.norm(v_da, axis=1)
+                    cos_ang = np.sum(v_dh * v_da, axis=1) / (norm_dh * norm_da + 1e-9)
+                    angles = np.degrees(np.arccos(np.clip(cos_ang, -1.0, 1.0)))
+
+                    for k in range(len(angles)):
+                        ang = angles[k]
+                        dist = d_da[cand_d[k], cand_a[k]]
+                        d_bb = is_bb_flags[cand_d[k]]
+                        a_bb = acc_is_bb[cand_a[k]]
+                        if ang >= 120.0:
+                            strict_35_120 += 1
+                            if d_bb and a_bb:
+                                strict_bb_bb += 1
+                            elif not d_bb and not a_bb:
+                                strict_sc_sc += 1
+                            else:
+                                strict_sc_bb += 1
+                        if ang >= 135.0 and dist < 3.0:
+                            strict_30_135 += 1
+
+            row["HBOND_STRICT_total_3_5A_120deg"] = float(strict_35_120)
+            row["HBOND_STRICT_total_3_0A_135deg"] = float(strict_30_135)
+            row["HBOND_STRICT_BB_BB_120deg"] = float(strict_bb_bb)
+            row["HBOND_STRICT_SC_SC_120deg"] = float(strict_sc_sc)
+            row["HBOND_STRICT_SC_BB_120deg"] = float(strict_sc_bb)
+
             if len(hydro_A) and len(hydro_B):
                 row["TOTAL_hydrophobic_contacts"] = float(np.sum(distances.distance_array(hydro_A.positions, hydro_B.positions) < 4.5))
             else:
@@ -377,20 +610,38 @@ class ComprehensiveFeatureExtractor:
                 G.add_node(f"B_{rB.resid}")
 
             edge_cnt = 0
+            edge_weights = []
             for rA_id, rB_id, d_val in pair_d_mins:
                 if d_val < 4.5:
-                    G.add_edge(f"A_{rA_id}", f"B_{rB_id}")
+                    w = float(1.0 / (d_val + 1e-2))
+                    G.add_edge(f"A_{rA_id}", f"B_{rB_id}", weight=w, length=d_val)
+                    edge_weights.append(w)
                     edge_cnt += 1
 
-            degrees = [deg for n, deg in G.degree()]
+            degrees = [deg for _, deg in G.degree()]
             row["GRAPH_total_edges"] = float(edge_cnt)
             row["GRAPH_avg_degree"] = float(np.mean(degrees)) if degrees else 0.0
             row["GRAPH_max_degree"] = float(max(degrees)) if degrees else 0.0
+            row["GRAPH_weighted_total_strength"] = float(sum(edge_weights)) if edge_weights else 0.0
+            node_strengths = [val for _, val in G.degree(weight='weight')]
+            row["GRAPH_weighted_avg_strength"] = float(np.mean(node_strengths)) if node_strengths else 0.0
+            try:
+                # NetworkX global_efficiency ignores edge weights. Use contact distance
+                # as path length so stronger contacts provide shorter paths.
+                row["GRAPH_global_efficiency"] = float(nx.global_efficiency(G))
+                weighted_lengths = dict(nx.all_pairs_dijkstra_path_length(G, weight="length"))
+                pair_eff = [1.0 / distance for source, distances_from_source in weighted_lengths.items()
+                             for target, distance in distances_from_source.items()
+                             if source != target and distance > 0]
+                row["GRAPH_weighted_global_efficiency"] = float(np.mean(pair_eff)) if pair_eff else 0.0
+            except Exception:
+                row["GRAPH_global_efficiency"] = 0.0
+                row["GRAPH_weighted_global_efficiency"] = 0.0
 
             deg_cent = nx.degree_centrality(G)
             row["GRAPH_avg_degree_centrality"] = float(np.mean(list(deg_cent.values())))
 
-            betweenness = nx.betweenness_centrality(G)
+            betweenness = nx.betweenness_centrality(G, weight="length")
             row["GRAPH_max_betweenness"] = float(max(betweenness.values())) if betweenness else 0.0
             row["GRAPH_avg_betweenness"] = float(np.mean(list(betweenness.values()))) if betweenness else 0.0
 
@@ -404,7 +655,45 @@ class ComprehensiveFeatureExtractor:
             else:
                 row["GRAPH_spectral_gap_lambda2"] = 0.0
 
-            for chain_tag, resid, phi, psi, chi1 in torsion_groups:
+            # Per-residue interface displacement, RMSF & B-factor equivalents
+            disps_A = []
+            for rA in self.res_A_list:
+                if rA.resid in self.ref_ca_pos_A:
+                    ca_atom = u.select_atoms(f"chainID A and resid {rA.resid} and name CA")[0]
+                    ca_cur = aligned_ca_by_index[int(ca_atom.index)]
+                    disp = float(np.linalg.norm(ca_cur - self.ref_ca_pos_A[rA.resid]))
+                    row[f"DISP_CA_A_{rA.resid}"] = disp
+                    rmsf = ca_to_rmsf[("A", int(rA.resid))]
+                    row[f"RMSF_CA_A_{rA.resid}"] = rmsf
+                    row[f"BFACTOR_RMSF_A_{rA.resid}"] = float((8.0 * np.pi**2 / 3.0) * (rmsf**2))
+                    disps_A.append(disp)
+
+            disps_B = []
+            for rB in self.res_B_list:
+                if rB.resid in self.ref_ca_pos_B:
+                    ca_atom = u.select_atoms(f"chainID B and resid {rB.resid} and name CA")[0]
+                    ca_cur = aligned_ca_by_index[int(ca_atom.index)]
+                    disp = float(np.linalg.norm(ca_cur - self.ref_ca_pos_B[rB.resid]))
+                    row[f"DISP_CA_B_{rB.resid}"] = disp
+                    rmsf = ca_to_rmsf[("B", int(rB.resid))]
+                    row[f"RMSF_CA_B_{rB.resid}"] = rmsf
+                    row[f"BFACTOR_RMSF_B_{rB.resid}"] = float((8.0 * np.pi**2 / 3.0) * (rmsf**2))
+                    disps_B.append(disp)
+
+            mean_disp_A = float(np.mean(disps_A)) if disps_A else 0.0
+            mean_disp_B = float(np.mean(disps_B)) if disps_B else 0.0
+            row["DYN_interface_mean_disp_A"] = mean_disp_A
+            row["DYN_interface_mean_disp_B"] = mean_disp_B
+            row["DYN_interface_max_disp_A"] = float(np.max(disps_A)) if disps_A else 0.0
+            row["DYN_interface_max_disp_B"] = float(np.max(disps_B)) if disps_B else 0.0
+            row["DYN_interface_mean_bfactor_A"] = float((8.0 * np.pi**2 / 3.0) * (mean_disp_A**2))
+            row["DYN_interface_mean_bfactor_B"] = float((8.0 * np.pi**2 / 3.0) * (mean_disp_B**2))
+            row["DYN_interface_mean_rmsf_A"] = float(np.mean([ca_to_rmsf[("A", int(r.resid))] for r in self.res_A_list]))
+            row["DYN_interface_mean_rmsf_B"] = float(np.mean([ca_to_rmsf[("B", int(r.resid))] for r in self.res_B_list]))
+            row["DYN_interface_mean_bfactor_rmsf_A"] = float((8.0 * np.pi**2 / 3.0) * row["DYN_interface_mean_rmsf_A"]**2)
+            row["DYN_interface_mean_bfactor_rmsf_B"] = float((8.0 * np.pi**2 / 3.0) * row["DYN_interface_mean_rmsf_B"]**2)
+
+            for chain_tag, resid, phi, psi, omega, chi1 in torsion_groups:
                 if phi is not None:
                     phi_rad = np.radians(phi.dihedral.value())
                     row[f"TORSION_{chain_tag}_{resid}_sin_phi"] = float(np.sin(phi_rad))
@@ -413,6 +702,10 @@ class ComprehensiveFeatureExtractor:
                     psi_rad = np.radians(psi.dihedral.value())
                     row[f"TORSION_{chain_tag}_{resid}_sin_psi"] = float(np.sin(psi_rad))
                     row[f"TORSION_{chain_tag}_{resid}_cos_psi"] = float(np.cos(psi_rad))
+                if omega is not None:
+                    omega_rad = np.radians(omega.dihedral.value())
+                    row[f"TORSION_{chain_tag}_{resid}_sin_omega"] = float(np.sin(omega_rad))
+                    row[f"TORSION_{chain_tag}_{resid}_cos_omega"] = float(np.cos(omega_rad))
                 if chi1 is not None:
                     chi1_rad = np.radians(chi1.dihedral.value())
                     row[f"TORSION_{chain_tag}_{resid}_sin_chi1"] = float(np.sin(chi1_rad))
@@ -421,26 +714,77 @@ class ComprehensiveFeatureExtractor:
             records.append(row)
 
         df = pd.DataFrame(records)
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_pickle(cache_path)
         return df
 
-    def build_dataset(self, class0_top, class0_trajs, class1_top, class1_trajs, max_frames=None, frame_stride=1):
+    def _cache_path(self, topology, trajectory, max_frames, frame_stride, cache_dir):
+        stat_parts = []
+        for path in (self.reference_pdb, topology, trajectory):
+            file_path = Path(path).resolve()
+            stat = file_path.stat()
+            stat_parts.append(f"{file_path}:{stat.st_size}:{stat.st_mtime_ns}")
+        token = "|".join([FEATURE_CACHE_VERSION, *stat_parts, str(max_frames), str(frame_stride)])
+        digest = hashlib.sha256(token.encode()).hexdigest()[:20]
+        return Path(cache_dir) / f"features_{digest}.pkl"
+
+    def extract_condition_features(self, topology, trajectories, max_frames=None, frame_stride=1,
+                                   cache_dir=None, workers=1):
+        if not trajectories:
+            raise ValueError("At least one trajectory is required for feature extraction.")
+        if workers < 1:
+            raise ValueError("workers must be positive.")
+
+        cache_dir = Path(cache_dir) if cache_dir is not None else None
+        specs = []
+        for trajectory in trajectories:
+            cache_path = self._cache_path(topology, trajectory, max_frames, frame_stride, cache_dir) if cache_dir else None
+            specs.append((topology, trajectory, cache_path))
+
+        def extract(spec):
+            top, traj, cache_path = spec
+            return self.extract_trajectory_features(
+                top, traj, max_frames=max_frames, frame_stride=frame_stride, cache_path=cache_path
+            )
+
+        if workers == 1:
+            frames = [extract(spec) for spec in specs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                frames = list(executor.map(extract, specs))
+        return pd.concat(frames, ignore_index=True)
+
+    def build_dataset(self, class0_top, class0_trajs, class1_top, class1_trajs,
+                      max_frames=None, frame_stride=1, cache_dir=None, workers=1):
+        if workers < 1:
+            raise ValueError("workers must be positive.")
         frames = []
         labels = []
         groups = []
 
-        for i, traj in enumerate(class0_trajs):
-            rep_label = f"rep_{i+1}"
-            df_rep = self.extract_trajectory_features(class0_top, traj, max_frames=max_frames, frame_stride=frame_stride)
-            frames.append(df_rep)
-            labels.extend([0] * len(df_rep))
-            groups.extend([rep_label] * len(df_rep))
+        for label, topology, trajectories in ((0, class0_top, class0_trajs), (1, class1_top, class1_trajs)):
+            specs = []
+            for trajectory in trajectories:
+                cache_path = self._cache_path(topology, trajectory, max_frames, frame_stride, cache_dir) if cache_dir else None
+                specs.append((topology, trajectory, cache_path))
 
-        for i, traj in enumerate(class1_trajs):
-            rep_label = f"rep_{i+1}"
-            df_rep = self.extract_trajectory_features(class1_top, traj, max_frames=max_frames, frame_stride=frame_stride)
-            frames.append(df_rep)
-            labels.extend([1] * len(df_rep))
-            groups.extend([rep_label] * len(df_rep))
+            def extract(spec):
+                top, traj, cache_path = spec
+                return self.extract_trajectory_features(
+                    top, traj, max_frames=max_frames, frame_stride=frame_stride, cache_path=cache_path
+                )
+
+            if workers == 1:
+                condition_frames = [extract(spec) for spec in specs]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    condition_frames = list(executor.map(extract, specs))
+
+            for i, df_rep in enumerate(condition_frames):
+                frames.append(df_rep)
+                labels.extend([label] * len(df_rep))
+                groups.extend([f"rep_{i+1}"] * len(df_rep))
 
         X_full = pd.concat(frames, ignore_index=True)
         y_full = np.array(labels)
@@ -453,11 +797,15 @@ class ComprehensiveFeatureExtractor:
 class MDPreprocessor:
     def __init__(self):
         self.scaler = StandardScaler()
-        self.active_cols = None
 
     def fit_transform_split(self, X_full, y_full, groups_full, test_group="rep_3"):
         train_mask = (groups_full != test_group)
         test_mask = (groups_full == test_group)
+
+        if not train_mask.any():
+            raise ValueError(f"No training frames found after excluding test group {test_group!r}.")
+        if not test_mask.any():
+            raise ValueError(f"No test frames found for test group {test_group!r}.")
 
         X_train_raw = X_full[train_mask].reset_index(drop=True)
         y_train = y_full[train_mask]
@@ -467,14 +815,16 @@ class MDPreprocessor:
         y_test = y_full[test_mask]
 
         var_filter = X_train_raw.std() > 1e-6
-        self.active_cols = X_train_raw.columns[var_filter].tolist()
-        logger.info(f"Filtered out {X_full.shape[1] - len(self.active_cols)} constant features. Active features: {len(self.active_cols)}")
+        active_cols = X_train_raw.columns[var_filter].tolist()
+        logger.info(f"Filtered out {X_full.shape[1] - len(active_cols)} constant features. Active features: {len(active_cols)}")
 
-        X_tr_clean = X_train_raw[self.active_cols]
-        X_te_clean = X_test_raw[self.active_cols]
+        X_tr_clean = X_train_raw[active_cols]
+        X_te_clean = X_test_raw[active_cols]
+        self.X_train_clean_ = X_tr_clean.copy()
+        self.X_test_clean_ = X_te_clean.copy()
 
-        X_train_scaled = pd.DataFrame(self.scaler.fit_transform(X_tr_clean), columns=self.active_cols)
-        X_test_scaled = pd.DataFrame(self.scaler.transform(X_te_clean), columns=self.active_cols)
+        X_train_scaled = pd.DataFrame(self.scaler.fit_transform(X_tr_clean), columns=active_cols)
+        X_test_scaled = pd.DataFrame(self.scaler.transform(X_te_clean), columns=active_cols)
 
         return X_train_scaled, y_train, groups_train, X_test_scaled, y_test
 
@@ -523,18 +873,25 @@ class CorrelationAnalyzer:
 
 
 class FeatureEliminationLoop:
-    def __init__(self, corr_threshold=0.98, accuracy_tolerance=0.05, out_dir="results"):
+    def __init__(self, corr_threshold=0.98, accuracy_tolerance=0.05, out_dir="results", random_state=42):
         self.analyzer = CorrelationAnalyzer(threshold=corr_threshold)
         self.accuracy_tolerance = accuracy_tolerance
+        self.random_state = random_state
         self.out_dir = Path(out_dir)
         self.corr_dir = self.out_dir / "correlation_matrices"
         self.corr_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self, X_train, y_train, groups_train, X_test, y_test):
+    def run(self, X_train, y_train, groups_train):
         logger.info(f"Starting Iterative Feature Elimination at threshold = {self.analyzer.threshold}...")
 
-        val_mask = (groups_train == "rep_2")
-        train_mask = (groups_train == "rep_1")
+        available_groups = sorted(np.unique(groups_train), key=lambda value: int(value.split("_")[-1]))
+        if len(available_groups) < 2:
+            raise ValueError("Feature elimination requires at least two training replica groups.")
+        train_mask = (groups_train == available_groups[0])
+        val_mask = (groups_train == available_groups[1])
+
+        if not train_mask.any() or not val_mask.any():
+            raise ValueError("Feature elimination requires both rep_1 training frames and rep_2 validation frames.")
 
         X_tr_inner = X_train.loc[train_mask].reset_index(drop=True)
         y_tr_inner = y_train[train_mask]
@@ -546,7 +903,7 @@ class FeatureEliminationLoop:
         corr_initial = self.analyzer.fit(X_train)
         corr_initial.to_csv(self.corr_dir / "corr_matrix_initial.csv")
 
-        rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        rf = RandomForestClassifier(n_estimators=100, random_state=self.random_state, n_jobs=-1)
         rf.fit(X_tr_inner, y_tr_inner)
         baseline_acc = accuracy_score(y_val_inner, rf.predict(X_val_inner))
         importances = dict(zip(active_features, rf.feature_importances_))
@@ -607,12 +964,14 @@ class FeatureEliminationLoop:
 
 
 class ModelTrainer:
-    def __init__(self):
+    def __init__(self, random_state=42):
+        self.random_state = random_state
         self.models = {
-            "Random Forest": RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1),
-            "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42, C=1.0),
-            "MLP (Neural Net)": MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+            "Random Forest": RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
+            "Logistic Regression": LogisticRegression(max_iter=1000, random_state=random_state, C=1.0),
+            "MLP (Neural Net)": MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=random_state)
         }
+        self.test_predictions = {}
 
     def train_and_evaluate(self, X_tr, y_tr, X_te, y_te):
         metrics = {}
@@ -620,6 +979,7 @@ class ModelTrainer:
             model.fit(X_tr, y_tr)
             preds = model.predict(X_te)
             probs = model.predict_proba(X_te)[:, 1] if hasattr(model, 'predict_proba') else None
+            self.test_predictions[name] = (preds, probs)
 
             acc = accuracy_score(y_te, preds)
             bal_acc = balanced_accuracy_score(y_te, preds)
@@ -627,6 +987,9 @@ class ModelTrainer:
             rec = recall_score(y_te, preds)
             f1 = f1_score(y_te, preds)
             auc = roc_auc_score(y_te, probs) if probs is not None else float('nan')
+            pr_auc = average_precision_score(y_te, probs) if probs is not None else float('nan')
+            loss = log_loss(y_te, probs) if probs is not None else float('nan')
+            brier = brier_score_loss(y_te, probs) if probs is not None else float('nan')
 
             metrics[name] = {
                 "Accuracy": acc,
@@ -634,11 +997,87 @@ class ModelTrainer:
                 "Precision": prec,
                 "Recall": rec,
                 "F1-Score": f1,
-                "ROC-AUC": auc
+                "ROC-AUC": auc,
+                "PR-AUC": pr_auc,
+                "Log-Loss": loss,
+                "Brier-Score": brier,
             }
             logger.info(f"[{name}] Test Acc: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
 
         return pd.DataFrame(metrics).T
+
+    def group_cross_validate(self, X, y, groups, n_splits=2):
+        unique_groups = np.unique(groups)
+        if n_splits < 2 or n_splits > len(unique_groups):
+            raise ValueError(f"n_splits must be between 2 and {len(unique_groups)} for the available groups.")
+
+        splitter = GroupKFold(n_splits=n_splits)
+        records = []
+        for name, model in self.models.items():
+            fold_metrics = []
+            for train_idx, val_idx in splitter.split(X, y, groups):
+                fold_model = clone(model)
+                scaler = StandardScaler()
+                X_train_fold = scaler.fit_transform(X.iloc[train_idx])
+                X_val_fold = scaler.transform(X.iloc[val_idx])
+                fold_model.fit(X_train_fold, y[train_idx])
+                preds = fold_model.predict(X_val_fold)
+                probs = fold_model.predict_proba(X_val_fold)[:, 1]
+                fold_metrics.append({
+                    "Accuracy": accuracy_score(y[val_idx], preds),
+                    "Balanced_Accuracy": balanced_accuracy_score(y[val_idx], preds),
+                    "F1": f1_score(y[val_idx], preds, zero_division=0),
+                    "ROC_AUC": roc_auc_score(y[val_idx], probs) if len(np.unique(y[val_idx])) > 1 else np.nan,
+                })
+            fold_df = pd.DataFrame(fold_metrics)
+            records.append({
+                "Model": name,
+                "Folds": n_splits,
+                **{f"{column}_Mean": fold_df[column].mean() for column in fold_df.columns},
+                **{f"{column}_Std": fold_df[column].std(ddof=1) for column in fold_df.columns},
+            })
+        return pd.DataFrame(records)
+
+    def bootstrap_test_metrics(self, y_test, n_bootstrap=200, confidence=0.95,
+                               random_state=None, block_size=10):
+        if not self.test_predictions:
+            raise RuntimeError("train_and_evaluate must be called before bootstrapping test metrics.")
+        if n_bootstrap < 1:
+            raise ValueError("n_bootstrap must be positive.")
+
+        rng = np.random.default_rng(self.random_state if random_state is None else random_state)
+        rows = []
+        y_test = np.asarray(y_test)
+        alpha = (1.0 - confidence) / 2.0
+        block_size = max(1, min(int(block_size), len(y_test)))
+        blocks = [np.arange(start, min(start + block_size, len(y_test)))
+                  for start in range(0, len(y_test), block_size)]
+        for model_name, (preds, probs) in self.test_predictions.items():
+            samples = {"Accuracy": [], "Balanced_Accuracy": [], "F1": [], "ROC_AUC": []}
+            for _ in range(n_bootstrap):
+                sampled_blocks = rng.integers(0, len(blocks), len(blocks))
+                indices = np.concatenate([blocks[i] for i in sampled_blocks])[:len(y_test)]
+                y_sample = y_test[indices]
+                pred_sample = preds[indices]
+                prob_sample = probs[indices]
+                samples["Accuracy"].append(accuracy_score(y_sample, pred_sample))
+                samples["Balanced_Accuracy"].append(balanced_accuracy_score(y_sample, pred_sample))
+                samples["F1"].append(f1_score(y_sample, pred_sample, zero_division=0))
+                samples["ROC_AUC"].append(
+                    roc_auc_score(y_sample, prob_sample) if len(np.unique(y_sample)) > 1 else np.nan
+                )
+            for metric, values in samples.items():
+                values = np.asarray(values, dtype=float)
+                rows.append({
+                    "Model": model_name,
+                    "Metric": metric,
+                    "Estimate": float(np.nanmean(values)),
+                    "CI_Lower": float(np.nanquantile(values, alpha)),
+                    "CI_Upper": float(np.nanquantile(values, 1.0 - alpha)),
+                    "Bootstrap_Samples": n_bootstrap,
+                    "Confidence": confidence,
+                })
+        return pd.DataFrame(rows)
 
 
 def categorize_feature(feat):
@@ -648,6 +1087,8 @@ def categorize_feature(feat):
         return "Aromatic / Pi-Stacking"
     elif feat.startswith("CATPI_") or feat.startswith("TOTAL_cation_pi"):
         return "Cation-Pi Interaction"
+    elif feat.startswith("HBOND_STRICT_"):
+        return "Directional Hydrogen Bond (Strict Angle)"
     elif feat.startswith("HBOND_") or feat.startswith("HB_"):
         return "Directional Hydrogen Bond"
     elif feat.startswith("DIPOLE_"):
@@ -658,6 +1099,14 @@ def categorize_feature(feat):
         return "Hydrophobic Packing"
     elif feat.startswith("TOTAL_polar"):
         return "Hydrogen Bonding / Polar"
+    elif feat.startswith("SASA_") or feat.startswith("BURIED_"):
+        return "Solvent Accessible & Buried Surface Area"
+    elif feat.startswith("INTERFACE_"):
+        return "Interface Geometry & Planarity"
+    elif feat.startswith("BFACTOR_"):
+        return "Dynamic Fluctuation & B-Factor Equivalent"
+    elif feat.startswith("DISP_"):
+        return "Interface Residue Displacement"
     elif feat.startswith("GRAPH_"):
         return "Network Topology / Centrality"
     elif feat.startswith("GLOBAL_"):
@@ -682,14 +1131,43 @@ def categorize_feature(feat):
         return "Biophysical"
 
 
+def grouped_permutation_importance(model, X, y, repeats=10, random_state=42):
+    """Permute correlated biological feature groups together."""
+    rng = np.random.default_rng(random_state)
+    baseline = accuracy_score(y, model.predict(X))
+    groups = {}
+    for feature in X.columns:
+        cluster = map_feature_to_cluster(feature)
+        groups.setdefault(cluster, []).append(feature)
+
+    records = []
+    for cluster, features in sorted(groups.items()):
+        drops = []
+        for _ in range(repeats):
+            permuted = X.copy()
+            order = rng.permutation(len(X))
+            permuted.loc[:, features] = X.iloc[order][features].to_numpy()
+            drops.append(baseline - accuracy_score(y, model.predict(permuted)))
+        records.append({
+            "Cluster": cluster,
+            "Category": categorize_cluster(cluster),
+            "Num_Features": len(features),
+            "Permutation_Accuracy_Drop_Mean": float(np.mean(drops)),
+            "Permutation_Accuracy_Drop_Std": float(np.std(drops, ddof=1)) if len(drops) > 1 else 0.0,
+            "Permutation_Repeats": repeats,
+        })
+    return pd.DataFrame(records).sort_values("Permutation_Accuracy_Drop_Mean", ascending=False)
+
+
 class LOFOAblationEngine:
-    def __init__(self, out_dir="results"):
+    def __init__(self, out_dir="results", random_state=42):
         self.out_dir = Path(out_dir)
+        self.random_state = random_state
 
     def run(self, X_train, y_train, X_test, y_test, max_corr_series=None):
         logger.info(f"Starting Leave-One-Feature-Out (LOFO) ablation across {X_train.shape[1]} features...")
 
-        baseline_clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        baseline_clf = RandomForestClassifier(n_estimators=100, random_state=self.random_state, n_jobs=-1)
         baseline_clf.fit(X_train, y_train)
 
         base_preds = baseline_clf.predict(X_test)
@@ -710,7 +1188,7 @@ class LOFOAblationEngine:
             X_tr_sub = X_train[sub_cols]
             X_te_sub = X_test[sub_cols]
 
-            clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=1)
+            clf = RandomForestClassifier(n_estimators=100, random_state=self.random_state, n_jobs=1)
             clf.fit(X_tr_sub, y_train)
 
             preds = clf.predict(X_te_sub)
@@ -760,6 +1238,8 @@ class LOFOAblationEngine:
 
 
 def map_feature_to_cluster(feat):
+    if feat.startswith("CLUSTER_") or feat.startswith("PAIR_"):
+        return feat
     m_pair = re.search(r'([A-Z0-9]+)_A_([A-Z0-9]+)_B_([A-Z0-9]+)', feat)
     if m_pair:
         return f"PAIR_A_{m_pair.group(2)}_B_{m_pair.group(3)}"
@@ -770,6 +1250,14 @@ def map_feature_to_cluster(feat):
         return "CLUSTER_GLOBAL_SHAPE"
     if feat.startswith("DYN_"):
         return "CLUSTER_GLOBAL_DYNAMICS"
+    if feat.startswith("DISP_") or feat.startswith("BFACTOR_"):
+        return "CLUSTER_INTERFACE_DISPLACEMENT"
+    if feat.startswith("SASA_") or feat.startswith("BURIED_"):
+        return "CLUSTER_SASA_BURIED_AREA"
+    if feat.startswith("INTERFACE_"):
+        return "CLUSTER_INTERFACE_GEOMETRY"
+    if feat.startswith("HBOND_STRICT_"):
+        return "CLUSTER_STRICT_HBONDS"
     if feat.startswith("DIPOLE_"):
         return "CLUSTER_ELECTROSTATIC_DIPOLE"
     if feat.startswith("PACKING_") or feat.startswith("TOTAL_hydrophobic") or feat.startswith("RATIO_polar"):
@@ -790,6 +1278,17 @@ def map_feature_to_cluster(feat):
     return "CLUSTER_MISC"
 
 
+def build_grouped_features(X):
+    """Collapse correlated representations into biological group features."""
+    groups = {}
+    for feature in X.columns:
+        groups.setdefault(map_feature_to_cluster(feature), []).append(feature)
+    return pd.DataFrame(
+        {cluster: X[features].mean(axis=1) for cluster, features in sorted(groups.items())},
+        index=X.index,
+    )
+
+
 def categorize_cluster(cluster):
     if cluster.startswith("PAIR_"):
         return "Residue-Pair Interface Contact"
@@ -797,6 +1296,14 @@ def categorize_cluster(cluster):
         return "Global Shape & Size"
     elif cluster == "CLUSTER_GLOBAL_DYNAMICS":
         return "Global Dynamics & RMSD"
+    elif cluster == "CLUSTER_INTERFACE_DISPLACEMENT":
+        return "Interface Fluctuation & B-Factor Displacement"
+    elif cluster == "CLUSTER_SASA_BURIED_AREA":
+        return "Solvent Accessible & Buried Surface Area"
+    elif cluster == "CLUSTER_INTERFACE_GEOMETRY":
+        return "Interface Geometry & Planarity"
+    elif cluster == "CLUSTER_STRICT_HBONDS":
+        return "Directional Hydrogen Bonds (Strict Angle)"
     elif cluster == "CLUSTER_ELECTROSTATIC_DIPOLE":
         return "Dipole & Electrostatic Alignment"
     elif cluster == "CLUSTER_INTERFACE_PACKING":
@@ -816,8 +1323,9 @@ def categorize_cluster(cluster):
 
 
 class GroupLOFOEngine:
-    def __init__(self, out_dir="results"):
+    def __init__(self, out_dir="results", random_state=42):
         self.out_dir = Path(out_dir)
+        self.random_state = random_state
 
     def run(self, X_train, y_train, X_test, y_test, prom_df=None):
         logger.info("Starting Group-Level LOFO (Cluster Ablation) across functional & residue clusters...")
@@ -825,7 +1333,7 @@ class GroupLOFOEngine:
         clusters = sorted(list(set(cluster_map.values())))
         logger.info(f"Identified {len(clusters)} distinct biological clusters across {X_train.shape[1]} features.")
 
-        baseline_clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        baseline_clf = RandomForestClassifier(n_estimators=100, random_state=self.random_state, n_jobs=-1)
         baseline_clf.fit(X_train, y_train)
 
         base_preds = baseline_clf.predict(X_test)
@@ -850,7 +1358,7 @@ class GroupLOFOEngine:
             sub_cols = [c for c in X_train.columns if cluster_map[c] != cl]
             cl_feats = [c for c in X_train.columns if cluster_map[c] == cl]
 
-            clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+            clf = RandomForestClassifier(n_estimators=100, random_state=self.random_state, n_jobs=-1)
             clf.fit(X_train[sub_cols], y_train)
 
             preds = clf.predict(X_test[sub_cols])
@@ -965,7 +1473,6 @@ class PipelineVisualizer:
         plt.xlabel("Prominence Score (RF Importance & Permutation Score)", fontsize=11, fontweight="bold")
         plt.title(f"Top {top_n} Most Prominent Biophysical Features", fontsize=14, fontweight="bold", pad=14)
 
-        from matplotlib.patches import Patch
         legend_elements = [Patch(facecolor=col, edgecolor='black', label=cat) for cat, col in cat_colors.items()]
         plt.legend(handles=legend_elements, title="Biophysical Category", loc="lower right", framealpha=0.9)
         plt.tight_layout()

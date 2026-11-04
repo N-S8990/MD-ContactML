@@ -164,9 +164,7 @@ def run_replicas(input_pdb, base_out_dir, prefix, args):
 
     for rep_id in replicas_to_run:
         replica_dir = get_replica_dir(base_out_dir, rep_id)
-        logger.info(f"============================================================")
         logger.info(f"STARTING SIMULATION FOR REPLICA {rep_id} IN: {replica_dir}")
-        logger.info(f"============================================================")
         rep_seed = (args.seed + (rep_id - 1) * 1000) if args.seed is not None else (1000 * rep_id + 42)
         run_temperature_series(input_pdb, replica_dir, prefix, args, seed=rep_seed)
 
@@ -175,7 +173,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run MD Simulation with OpenMM across Replicas and Temperatures")
     parser.add_argument("--input_pdb", type=str, default=DEFAULT_INPUT_PDB, help="Input PDB file (default: 1A22.pdb)")
     parser.add_argument("--out_dir", type=str, default="data", help="Base output directory (default: data)")
-    parser.add_argument("--num_replicas", type=int, default=3, help="Number of independent replicas to simulate (default: 3)")
+    parser.add_argument("--num_replicas", type=int, default=5, help="Number of independent replicas to simulate (default: 5)")
     parser.add_argument("--replica_id", type=int, default=None,
                         help="Run only a specific replica ID (e.g. 1, 2, or 3). Default: None (runs all num_replicas).")
     parser.add_argument("--temperatures", nargs="+", type=int, default=[300, 400],

@@ -7,3 +7,5 @@ seaborn>=0.12.0
 MDAnalysis>=2.5.0
 networkx>=3.0.0
 tqdm>=4.65.0
+openmm>=8.1.0
+pdbfixer @ git+https://github.com/openmm/pdbfixer.git
